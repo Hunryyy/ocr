@@ -1,0 +1,17 @@
+{
+  "_comment": "DocLayout-YOLO (DocStructBench checkpoint) class-index to pipeline label mapping. Edit to match your ONNX export.",
+  "_reference": "https://github.com/opendatalab/DocLayout-YOLO",
+  "_class_order": "0=caption 1=footnote 2=formula 3=list-item 4=page-footer 5=page-header 6=picture 7=section-heading 8=table 9=table-caption 10=table-footnote 11=text",
+  "0": "caption",
+  "1": "footer",
+  "2": "formula",
+  "3": "paragraph",
+  "4": "footer",
+  "5": "header",
+  "6": "figure",
+  "7": "title",
+  "8": "table",
+  "9": "caption",
+  "10": "caption",
+  "11": "paragraph"
+}

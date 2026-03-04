@@ -35,6 +35,23 @@ models:
       type: "yolo"
       version: "yolov8n"
       score_threshold: 0.25
+      # --- DocLayout-YOLO / ONNX settings (set enabled: true and uncomment path/class_map to use) ---
+      # path: "./models/doclayout_yolo.onnx"      # path to ONNX weight file (≤150 MB)
+      # class_map: "./trainer/config/layout_class_map.json"  # index->label mapping
+      # input_size: 1024                           # inference resolution (pixels)
+      # nms_threshold: 0.5                         # IoU threshold used by class-agnostic NMS
+      # nms_class_aware: true                      # true=class-aware NMS (recommended)
+      # bbox_format: "auto"                        # "auto" | "xywh" | "xyxy"
+      # hf_correction: false                       # header/footer post-correction (enable in accurate profile)
+      # hf_top_ratio: 0.08                         # top page fraction for header detection
+      # hf_bottom_ratio: 0.08                      # bottom page fraction for footer detection
+      # hf_width_ratio: 0.5                        # min block-width/page-width to qualify
+      # second_pass: false                         # second-pass inference for difficult pages
+      # second_pass_min_dets: 2                    # trigger if pass-1 dets < this
+      # second_pass_min_nontext: 0                 # trigger if non-text dets <= this
+      # second_pass_min_avg_score: 0.0             # trigger if avg_score < this (0=disabled)
+      # second_pass_input_size: 1280               # larger resolution for second pass
+      # second_pass_score_threshold: 0.15          # lower threshold for second pass
     ocr:
       enabled: true
       version: "PP-OCRv4"
@@ -56,3 +73,39 @@ decode:
     max_empty_text_block_ratio: 0.0
     trigger_detector: true
     trigger_ocr: true
+
+# ============================================================================
+# Profile overlays  (merged on top of base config when profile is selected)
+# ============================================================================
+profiles:
+  fast:
+    fallback_models:
+      layout_detector:
+        input_size: 640
+        score_threshold: 0.3
+        nms_class_aware: true
+        second_pass: false
+        hf_correction: false
+
+  balanced:
+    fallback_models:
+      layout_detector:
+        input_size: 1024
+        score_threshold: 0.25
+        nms_class_aware: true
+        second_pass: false
+        hf_correction: false
+
+  accurate:
+    fallback_models:
+      layout_detector:
+        input_size: 1024
+        score_threshold: 0.2
+        nms_class_aware: true
+        hf_correction: true
+        second_pass: true
+        second_pass_min_dets: 3
+        second_pass_min_nontext: 0
+        second_pass_min_avg_score: 0.3
+        second_pass_input_size: 1280
+        second_pass_score_threshold: 0.15
