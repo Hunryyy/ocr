@@ -169,20 +169,18 @@ class ModelBundle:
     layout_input_size: int = 1024
     layout_nms_threshold: float = 0.5
     layout_score_threshold: float = 0.3
-    layout_nms_mode: str = "class_aware"  # "class_aware" | "agnostic"
-
-    # Header/footer post-hoc refinement
-    layout_hf_refine_enabled: bool = False
-    layout_hf_top_ratio: float = 0.08
-    layout_hf_bottom_ratio: float = 0.08
-    layout_hf_width_ratio: float = 0.6
-
-    # Second-pass strategy for difficult pages
-    layout_second_pass_enabled: bool = False
+    layout_nms_class_aware: bool = True
+    layout_bbox_format: str = "auto"          # "auto" | "xywh" | "xyxy"
+    layout_hf_correction: bool = False        # header/footer post-correction
+    layout_hf_top_ratio: float = 0.08        # top region fraction
+    layout_hf_bottom_ratio: float = 0.08     # bottom region fraction
+    layout_hf_width_ratio: float = 0.5       # min width fraction to qualify
+    layout_second_pass: bool = False          # second-pass inference
+    layout_second_pass_min_dets: int = 2      # trigger if dets < this
+    layout_second_pass_min_nontext: int = 0   # trigger if non-text dets <= this
+    layout_second_pass_min_avg_score: float = 0.0  # trigger if avg_score < this
     layout_second_pass_input_size: int = 1280
-    layout_second_pass_score_threshold: float = 0.2
-    layout_second_pass_min_detections: int = 2
-    layout_second_pass_avg_conf_threshold: float = 0.35
+    layout_second_pass_score_threshold: float = 0.15
 
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
@@ -355,7 +353,13 @@ def _load_onnx_model(path: Optional[str], debug_reasons: List[str]) -> Any:
         debug_reasons.append("onnxruntime_not_installed")
         return None
     try:
-        return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        # Prefer CUDA if available, fall back to CPU
+        available = ort.get_available_providers() if hasattr(ort, "get_available_providers") else []
+        providers = []
+        if "CUDAExecutionProvider" in available:
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+        return ort.InferenceSession(path, providers=providers)
     except Exception as e:
         debug_reasons.append(f"onnx_load_error:{str(e)[:120]}")
         return None
@@ -405,16 +409,18 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
         bundle.layout_input_size = int(layout_cfg.get("input_size", 1024) or 1024)
         bundle.layout_nms_threshold = float(layout_cfg.get("nms_threshold", 0.5) or 0.5)
         bundle.layout_score_threshold = float(layout_cfg.get("score_threshold", 0.3) or 0.3)
-        bundle.layout_nms_mode = str(layout_cfg.get("nms_mode", "class_aware") or "class_aware")
-        bundle.layout_hf_refine_enabled = bool(layout_cfg.get("hf_refine_enabled", False))
+        bundle.layout_nms_class_aware = bool(layout_cfg.get("nms_class_aware", True))
+        bundle.layout_bbox_format = str(layout_cfg.get("bbox_format", "auto") or "auto")
+        bundle.layout_hf_correction = bool(layout_cfg.get("hf_correction", False))
         bundle.layout_hf_top_ratio = float(layout_cfg.get("hf_top_ratio", 0.08) or 0.08)
         bundle.layout_hf_bottom_ratio = float(layout_cfg.get("hf_bottom_ratio", 0.08) or 0.08)
-        bundle.layout_hf_width_ratio = float(layout_cfg.get("hf_width_ratio", 0.6) or 0.6)
-        bundle.layout_second_pass_enabled = bool(layout_cfg.get("second_pass_enabled", False))
+        bundle.layout_hf_width_ratio = float(layout_cfg.get("hf_width_ratio", 0.5) or 0.5)
+        bundle.layout_second_pass = bool(layout_cfg.get("second_pass", False))
+        bundle.layout_second_pass_min_dets = int(layout_cfg.get("second_pass_min_dets", 2) or 2)
+        bundle.layout_second_pass_min_nontext = int(layout_cfg.get("second_pass_min_nontext", 0) or 0)
+        bundle.layout_second_pass_min_avg_score = float(layout_cfg.get("second_pass_min_avg_score", 0.0) or 0.0)
         bundle.layout_second_pass_input_size = int(layout_cfg.get("second_pass_input_size", 1280) or 1280)
-        bundle.layout_second_pass_score_threshold = float(layout_cfg.get("second_pass_score_threshold", 0.2) or 0.2)
-        bundle.layout_second_pass_min_detections = int(layout_cfg.get("second_pass_min_detections", 2) or 2)
-        bundle.layout_second_pass_avg_conf_threshold = float(layout_cfg.get("second_pass_avg_conf_threshold", 0.35) or 0.35)
+        bundle.layout_second_pass_score_threshold = float(layout_cfg.get("second_pass_score_threshold", 0.15) or 0.15)
     else:
         bundle.layout_class_map = {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
 
@@ -1008,41 +1014,93 @@ def _letterbox_resize(img: Any, target_size: int):
     return padded, scale, (pad_x, pad_y), orig_w, orig_h
 
 
-def _parse_yolo_output(output: Any, num_classes: int, score_threshold: float) -> List[Dict[str, Any]]:
+def _parse_yolo_output(output: Any, num_classes: int, score_threshold: float,
+                       bbox_format: str = "auto") -> List[Dict[str, Any]]:
     """
-    Support YOLO-like outputs:
-    - [1,N,4+1+num_cls] (cx,cy,w,h,obj,cls...)
-    - [1,N,4+num_cls]   (cx,cy,w,h,cls...)
-    - [1,N,6]           (cx,cy,w,h,score,cls_id)
+    Parse YOLO-like ONNX outputs with broad shape compatibility:
+      - (1, N, 4+1+C)  cx,cy,w,h, objectness, cls_scores...  (YOLOv5/v8 multi-class)
+      - (1, N, 4+C)    cx,cy,w,h, cls_scores...              (anchor-free)
+      - (1, N, 6/7)    cx,cy,w,h, score, cls_id[, extra]     (single-score compact)
+      - (N, *)         same without batch dim
+      - (1, 4+C, N)    transposed DocLayout-YOLO export       (automatically transposed)
+    bbox_format: "auto" detects xywh vs xyxy heuristically; "xywh" / "xyxy" forces format.
     """
     if np is None:
         return []
-    arr = np.array(output)
-    if arr.ndim == 3:
-        arr = arr[0]
+    arr = np.array(output, dtype=np.float32)
+
+    # Squeeze leading batch dim
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]  # (N, C) or (C, N) after squeeze
+
+    # Detect transposed layout (C, N) where C = 4 + num_classes and N >> C.
+    # Only transpose when there are clearly more columns than rows, indicating
+    # a (C, N) layout rather than the expected (N, C).
+    if (arr.ndim == 2
+            and arr.shape[0] < arr.shape[1]
+            and arr.shape[0] >= (4 + num_classes)
+            and arr.shape[1] > arr.shape[0] * 2):
+        arr = arr.T
+
     if arr.ndim != 2:
+        sys.stderr.write(
+            f"[debug] _parse_yolo_output: unexpected array shape {arr.shape} after reshape; skipping\n"
+        )
         return []
+
     dets: List[Dict[str, Any]] = []
-    for det in arr:
-        det = det.tolist()
-        if len(det) >= 5 + num_classes:
-            cx, cy, w, h, obj = det[:5]
+    n_cols = arr.shape[1]
+
+    for row in arr:
+        det = row.tolist()
+        cls_idx: int = 0
+        score: float = 0.0
+
+        if n_cols >= 5 + num_classes:
+            # (cx, cy, w, h, obj, cls_scores...)
+            cx, cy, w, h, obj = det[0], det[1], det[2], det[3], det[4]
             cls_scores = det[5:5 + num_classes]
             cls_idx = int(np.argmax(cls_scores))
-            score = float(obj * cls_scores[cls_idx])
-        elif len(det) >= 4 + num_classes:
-            cx, cy, w, h = det[:4]
+            score = float(obj) * float(cls_scores[cls_idx])
+            fmt = "xywh"
+        elif n_cols >= 4 + num_classes:
+            # (cx, cy, w, h, cls_scores...)
+            cx, cy, w, h = det[0], det[1], det[2], det[3]
             cls_scores = det[4:4 + num_classes]
             cls_idx = int(np.argmax(cls_scores))
             score = float(cls_scores[cls_idx])
-        elif len(det) >= 6:
-            cx, cy, w, h, score, cls_idx = det[:6]
+            fmt = "xywh"
+        elif n_cols >= 6:
+            # Compact: (x, y, x2_or_w, y2_or_h, score, cls_id[, extra])
+            cx, cy, w, h, score, cls_idx = det[0], det[1], det[2], det[3], det[4], det[5]
             score, cls_idx = float(score), int(cls_idx)
+            fmt = "xywh"  # will be overridden by bbox_format below
         else:
+            sys.stderr.write(
+                f"[debug] _parse_yolo_output: row too short ({n_cols} cols, need >=6); skipping row\n"
+            )
             continue
-        if score >= score_threshold:
-            dets.append({"bbox": [float(cx), float(cy), float(w), float(h)],
-                         "label_idx": int(cls_idx), "score": float(score), "format": "cxcywh"})
+
+        if score < score_threshold:
+            continue
+
+        # Resolve bbox format
+        resolved_fmt = bbox_format if bbox_format in ("xywh", "xyxy") else fmt
+        # Auto-detection for compact rows (fewer cols than 4+num_classes):
+        # if x2 > x1 and y2 > y1, treat as xyxy corner coordinates.
+        if bbox_format == "auto" and n_cols < 4 + num_classes:
+            # For compact rows: x1<x2, y1<y2 suggests xyxy
+            if det[2] > det[0] and det[3] > det[1]:
+                resolved_fmt = "xyxy"
+            else:
+                resolved_fmt = "xywh"
+
+        dets.append({
+            "bbox": [float(cx), float(cy), float(w), float(h)],
+            "label_idx": cls_idx,
+            "score": score,
+            "format": resolved_fmt,
+        })
     return dets
 
 
@@ -1110,53 +1168,64 @@ def _map_to_original_coords(bbox_input_xyxy: List[float], scale: float, pad: Tup
     ]
 
 
-# Synonym map: raw label → canonical label
-_LABEL_SYNONYMS: Dict[str, str] = {
-    "text": "paragraph",
-    "equation": "formula",
-    "math": "formula",
-    "image": "figure",
-    "picture": "figure",
-    "figure_caption": "caption",
-    "table_caption": "caption",
-}
-
-
-def _normalize_layout_label(label: str) -> str:
-    """Map raw detector class name to canonical layout label."""
-    label = label.lower().strip()
-    label = _LABEL_SYNONYMS.get(label, label)
-    return label if label in SUPPORTED_BLOCK_TYPES else "unknown"
-
-
-def _refine_header_footer(
-    results: List[Dict[str, Any]],
-    orig_h: int,
-    orig_w: int,
-    top_ratio: float = 0.08,
-    bottom_ratio: float = 0.08,
-    width_ratio: float = 0.6,
-) -> List[Dict[str, Any]]:
+def _postprocess_header_footer(results: List[Dict[str, Any]], orig_h: int, orig_w: int,
+                               top_ratio: float, bottom_ratio: float,
+                               width_ratio: float) -> List[Dict[str, Any]]:
     """
-    Post-hoc heuristic: relabel blocks that span wide and sit near the top or
-    bottom of the page as header/footer respectively.  Only text-like blocks
-    are candidates; non-text blocks (table/figure/chart/formula) are left alone.
+    Heuristic post-correction: re-label paragraph/caption blocks that sit in
+    the top or bottom margin regions as header/footer respectively.
     """
-    if orig_h <= 0 or orig_w <= 0:
-        return results
-    top_threshold = orig_h * top_ratio
-    bottom_threshold = orig_h * (1.0 - bottom_ratio)
-    for det in results:
-        if det.get("label") in NON_TEXT_BLOCK_TYPES:
+    top_thresh = orig_h * top_ratio
+    bot_thresh = orig_h * (1.0 - bottom_ratio)
+    page_width = max(orig_w, 1)
+    out = []
+    for r in results:
+        new_r = dict(r)
+        label = r.get("label", "unknown")
+        if label in ("paragraph", "caption"):
+            x1, y1, x2, y2 = r["bbox"]
+            block_w = x2 - x1
+            if block_w / page_width >= width_ratio:
+                if y2 <= top_thresh:
+                    new_r["label"] = "header"
+                elif y1 >= bot_thresh:
+                    new_r["label"] = "footer"
+        out.append(new_r)
+    return out
+
+
+def _run_layout_once(img: Any, sess: Any, input_size: int, num_classes: int,
+                     score_thr: float, bbox_format: str,
+                     orig_w: int, orig_h: int) -> List[Dict[str, Any]]:
+    """
+    Run one forward pass through the layout detector session.
+    Returns raw results (bbox in original image coords, label mapped to SUPPORTED_BLOCK_TYPES).
+    """
+    padded, scale, pad, _ow, _oh = _letterbox_resize(img, input_size)
+    if padded is None:
+        return []
+    tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+    try:
+        input_name = sess.get_inputs()[0].name
+        outputs = sess.run(None, {input_name: tensor})
+        output_names = [o.name for o in sess.get_outputs()]
+    except Exception as e:
+        sys.stderr.write(f"[warning] layout detector inference error: {e}\n")
+        return []
+
+    dets: List[Dict[str, Any]] = []
+    if len(outputs) == 1:
+        dets = _parse_yolo_output(outputs[0], num_classes, score_thr, bbox_format)
+    else:
+        dets = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs)), score_thr)
+
+    results: List[Dict[str, Any]] = []
+    for det in dets:
+        bbox_in = _convert_to_xyxy(det, input_size)
+        bbox = _map_to_original_coords(bbox_in, scale, pad, orig_w, orig_h)
+        if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
             continue
-        x1, y1, x2, y2 = det["bbox"]
-        box_w = x2 - x1
-        if box_w / max(orig_w, 1) < width_ratio:
-            continue
-        if y2 <= top_threshold:
-            det["label"] = "header"
-        elif y1 >= bottom_threshold:
-            det["label"] = "footer"
+        results.append(det | {"bbox": bbox})
     return results
 
 
@@ -1191,79 +1260,80 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
         debug["layout_ms"] = round(_now_ms() - t0, 2)
         return []
 
-    def _run_single_pass(input_size: int, score_thr: float) -> Tuple[List[Dict[str, Any]], int, int]:
-        padded, scale, pad, orig_w, orig_h = _letterbox_resize(img, input_size)
-        if padded is None:
-            return [], 0, 0
-        tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-        sess = models.layout_detector
-        try:
-            input_name = sess.get_inputs()[0].name
-            outputs = sess.run(None, {input_name: tensor})
-            output_names = [o.name for o in sess.get_outputs()]
-        except Exception as e:
-            debug["layout_detector_status"] = f"inference_error:{str(e)[:120]}"
-            return [], orig_w, orig_h
-        num_classes = max(1, len(models.layout_class_map))
-        dets: List[Dict[str, Any]] = []
-        if len(outputs) == 1:
-            dets = _parse_yolo_output(outputs[0], num_classes, score_thr)
-        else:
-            dets = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs)), score_thr)
-        pass_results: List[Dict[str, Any]] = []
-        for det in dets:
-            bbox_in = _convert_to_xyxy(det, input_size)
-            bbox = _map_to_original_coords(bbox_in, scale, pad, orig_w, orig_h)
-            if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
-                continue
-            label = _normalize_layout_label(
-                models.layout_class_map.get(int(det["label_idx"]), "unknown")
-            )
-            pass_results.append({"bbox": bbox, "label": label, "score": float(det["score"])})
-        return pass_results, orig_w, orig_h
-
+    orig_w, orig_h = img.size
     input_size = int(models.layout_input_size or 1024)
+    num_classes = max(1, len(models.layout_class_map))
     score_thr = float(models.layout_score_threshold or 0.3)
+    bbox_format = str(models.layout_bbox_format or "auto")
+    sess = models.layout_detector
 
-    results, orig_w, orig_h = _run_single_pass(input_size, score_thr)
+    # --- First pass ---
+    raw_dets = _run_layout_once(img, sess, input_size, num_classes, score_thr,
+                                bbox_format, orig_w, orig_h)
+    if not raw_dets and models.layout_input_size == input_size:
+        # Likely preprocess failed
+        debug["layout_detector_status"] = "preprocess_failed"
+        debug["layout_ms"] = round(_now_ms() - t0, 2)
+        return []
 
-    # Second-pass: retry at higher resolution when page looks difficult
-    avg_conf_thr = float(models.layout_second_pass_avg_conf_threshold or 0.35)
-    if (
-        models.layout_second_pass_enabled
-        and (
-            len(results) < models.layout_second_pass_min_detections
-            or (results and (sum(r["score"] for r in results) / len(results)) < avg_conf_thr)
+    debug["layout_pass1_dets"] = len(raw_dets)
+
+    # --- Second pass (difficult page) ---
+    second_pass_triggered = False
+    if models.layout_second_pass:
+        n_dets = len(raw_dets)
+        n_nontext = sum(
+            1 for d in raw_dets
+            if models.layout_class_map.get(int(d.get("label_idx", -1)), "unknown")
+            in NON_TEXT_BLOCK_TYPES
         )
-    ):
-        sp_size = int(models.layout_second_pass_input_size or 1280)
-        sp_thr = float(models.layout_second_pass_score_threshold or 0.2)
-        second, sp_orig_w, sp_orig_h = _run_single_pass(sp_size, sp_thr)
-        if len(second) > len(results):
-            results, orig_w, orig_h = second, sp_orig_w, sp_orig_h
-            debug["layout_second_pass"] = True
+        avg_score = (sum(float(d.get("score", 0)) for d in raw_dets) / max(n_dets, 1)) if n_dets else 0.0
+        trigger = (
+            n_dets < models.layout_second_pass_min_dets
+            or n_nontext <= models.layout_second_pass_min_nontext
+            or (models.layout_second_pass_min_avg_score > 0 and avg_score < models.layout_second_pass_min_avg_score)
+        )
+        if trigger:
+            second_pass_triggered = True
+            sp_size = int(models.layout_second_pass_input_size or 1280)
+            sp_thr = float(models.layout_second_pass_score_threshold or 0.15)
+            raw_dets2 = _run_layout_once(img, sess, sp_size, num_classes, sp_thr,
+                                         bbox_format, orig_w, orig_h)
+            if len(raw_dets2) > len(raw_dets):
+                raw_dets = raw_dets2
+            debug["layout_pass2_dets"] = len(raw_dets2)
 
-    # Apply class-aware or agnostic NMS
-    nms_mode = (models.layout_nms_mode or "class_aware").lower()
-    if nms_mode == "agnostic":
-        results = _nms_python(results, float(models.layout_nms_threshold or 0.5))
-    else:
-        # class-aware: _nms_python(results) with no explicit threshold uses
-        # per-class thresholds from CLASS_NMS_THRESHOLDS
+    debug["layout_second_pass"] = second_pass_triggered
+
+    # --- Map labels ---
+    results: List[Dict[str, Any]] = []
+    for det in raw_dets:
+        bbox = det["bbox"]
+        label = models.layout_class_map.get(int(det["label_idx"]), "unknown")
+        if label == "text":
+            label = "paragraph"
+        if label not in SUPPORTED_BLOCK_TYPES:
+            label = "unknown"
+        results.append({"bbox": bbox, "label": label, "score": float(det["score"])})
+
+    # --- NMS: class-aware (default) or class-agnostic ---
+    if models.layout_nms_class_aware:
+        # _nms_python with iou_threshold=None uses per-class thresholds from CLASS_NMS_THRESHOLDS
         results = _nms_python(results)
+    else:
+        results = _nms_python(results, float(models.layout_nms_threshold or 0.5))
 
-    # Optional header/footer post-hoc refinement
-    if models.layout_hf_refine_enabled and results:
-        results = _refine_header_footer(
-            results,
-            orig_h,
-            orig_w,
-            top_ratio=models.layout_hf_top_ratio,
-            bottom_ratio=models.layout_hf_bottom_ratio,
-            width_ratio=models.layout_hf_width_ratio,
+    # --- Header/footer post-correction ---
+    if models.layout_hf_correction:
+        results = _postprocess_header_footer(
+            results, orig_h, orig_w,
+            models.layout_hf_top_ratio,
+            models.layout_hf_bottom_ratio,
+            models.layout_hf_width_ratio,
         )
 
     debug["layout_detector_status"] = "ok"
+    debug["layout_nms_class_aware"] = models.layout_nms_class_aware
     debug["layout_detections"] = len(results)
     debug["layout_ms"] = round(_now_ms() - t0, 2)
     return results
