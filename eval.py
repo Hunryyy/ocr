@@ -47,6 +47,24 @@ try:
 except ImportError:  # pragma: no cover
     Image = None
 
+try:
+    from utils.formula import normalize_latex, preprocess_formula_image, FormulaRecognizer
+    _FORMULA_MODULE_OK = True
+except ImportError:  # pragma: no cover
+    _FORMULA_MODULE_OK = False
+    def normalize_latex(latex: str) -> str:  # type: ignore[misc]
+        latex = (latex or "").strip()
+        if latex.startswith("$$") and latex.endswith("$$") and len(latex) >= 4:
+            latex = latex[2:-2].strip()
+        elif latex.startswith("$") and latex.endswith("$") and len(latex) >= 2:
+            latex = latex[1:-1].strip()
+        import re as _re
+        latex = _re.sub(r"\\displaystyle\s*", "", latex)
+        latex = _re.sub(r"\s+", " ", latex)
+        latex = latex.replace("\u2212", "-")
+        latex = latex.replace("\u00d7", r"\times ")
+        return latex.strip()
+
 
 # -----------------------------------------------------------------------------
 # Constants / type sets
@@ -151,6 +169,9 @@ class ModelBundle:
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
     model_disabled_reason: List[str] = field(default_factory=list)
+
+    # Formula recognizer
+    formula_recognizer: Any = None
 
 
 # -----------------------------------------------------------------------------
@@ -338,6 +359,13 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
 
     # ---- OCR ----
     bundle.ocr_engine = _maybe_load_paddle(cfg)
+
+    # ---- formula recognizer ----
+    if _FORMULA_MODULE_OK:
+        try:
+            bundle.formula_recognizer = FormulaRecognizer(paddle_ocr=bundle.ocr_engine)
+        except Exception:
+            bundle.formula_recognizer = None
 
     # ---- layout detector ----
     layout_cfg = (fallback_cfg.get("layout_detector") or models_cfg.get("layout_detector") or {}) or {}
@@ -1984,13 +2012,36 @@ def _extract_tables(blocks: List[Dict[str, Any]], ocr_lines: List[Dict[str, Any]
 
 
 # -----------------------------------------------------------------------------
-# Formula handling (placeholder for future latex OCR)
+# Formula handling
 # -----------------------------------------------------------------------------
-def _process_formula_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _process_formula_blocks(
+    blocks: List[Dict[str, Any]],
+    img_path: Optional[str] = None,
+    recognizer: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    处理所有 formula 类型 block：
+    - 若 latex 未设置，尝试用 FormulaRecognizer 识别（需要 img_path）
+    - 规范化 latex 字符串
+    - 保证 latex 字段存在（识别失败时为空字符串，保留结构）
+    """
     for b in blocks:
-        if b.get("type") == "formula":
-            if "latex" not in b or b.get("latex") is None:
-                b["latex"] = ""
+        if b.get("type") != "formula":
+            continue
+        raw = b.get("latex") or ""
+        # 若没有 latex 且有图片路径与识别器，尝试识别
+        if raw == "" and img_path and recognizer is not None and Image is not None:
+            try:
+                page_img = Image.open(img_path).convert("RGB")
+                bbox = b.get("bbox", [])
+                if len(bbox) == 4:
+                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    roi = page_img.crop((x1, y1, x2, y2))
+                    raw = recognizer.recognize(roi)
+            except Exception:
+                raw = ""
+        # Normalize and store
+        b["latex"] = normalize_latex(raw)
     return blocks
 
 
@@ -2447,7 +2498,7 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     - 图像: <div class="image" data-bbox="x1 y1 x2 y2"></div>
     - 图表: <div class="chart" data-bbox="x1 y1 x2 y2"></div>
     - 表格: <div class="table" data-bbox="x1 y1 x2 y2"><table>...</table></div>
-    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2" data-latex="..."></div>
+    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2">latex</div>
     - 列表项: <div class="list_item" data-bbox="x1 y1 x2 y2">文本</div>
     - 标题说明: <div class="caption" data-bbox="x1 y1 x2 y2">文本</div>
     - 页眉: <div class="header" data-bbox="x1 y1 x2 y2">文本</div>
@@ -2492,15 +2543,8 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     
     # 公式
     if btype == "formula":
-        latex = b.get("latex") or ""
-        latex = latex.strip()
-        if latex:
-            # 有 LaTeX 内容时添加 data-latex 属性
-            latex_escaped = _escape(latex)
-            return f'<div class="formula" data-bbox="{bbox_str}" data-latex="{latex_escaped}"></div>'
-        else:
-            # 无法识别 LaTeX 时忽略该属性
-            return f'<div class="formula" data-bbox="{bbox_str}"></div>'
+        latex = normalize_latex(b.get("latex") or "")
+        return f'<div class="formula" data-bbox="{bbox_str}">{latex}</div>'
     
     # 页眉
     if btype == "header":
@@ -2723,7 +2767,11 @@ def process_one(sample: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle
 
     # 6) Formula blocks
     try:
-        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+        ir["blocks"] = _process_formula_blocks(
+            ir.get("blocks", []),
+            img_path=img_path,
+            recognizer=getattr(models, "formula_recognizer", None),
+        )
     except Exception as e:
         debug["formula_error"] = str(e)[:200]
 
@@ -2861,7 +2909,11 @@ def _run_fallback(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle, 
 
     # 3) tables + formulas
     ir["tables"] = _extract_tables(ir.get("blocks", []), ocr_lines, img_path, ir.get("page", {}), cfg, models, debug)
-    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+    ir["blocks"] = _process_formula_blocks(
+        ir.get("blocks", []),
+        img_path=img_path,
+        recognizer=getattr(models, "formula_recognizer", None),
+    )
 
     debug["fallback_ms"] = round(_now_ms() - t0, 2)
     return ir, ocr_lines
