@@ -35,6 +35,30 @@ models:
       type: "yolo"
       version: "yolov8n"
       score_threshold: 0.25
+      # --- DocLayout-YOLO integration (fill in path to use) ---
+      # path: "artifacts/doclayout_yolo.onnx"       # ONNX weight path (≤150MB)
+      # input_size: 1024                             # Input image size (px); use 1280 for higher recall
+      # nms_threshold: 0.45                          # IoU threshold for NMS
+      # nms_mode: "class_aware"                      # "class_aware" (default) | "agnostic"
+      # enable_second_pass: false                    # Re-infer with larger input if first pass is poor
+      # enable_hf_correction: true                   # Heuristic header/footer position correction
+      # second_pass:
+      #   input_size: 1280                           # Larger input size for second pass
+      #   score_threshold: 0.15                      # Lower threshold for second pass
+      #   min_dets_trigger: 2                        # Trigger if first pass has fewer than this many dets
+      # class_map:                                   # Map model class indices to project labels
+      #   0: "title"
+      #   1: "paragraph"
+      #   2: "table"
+      #   3: "figure"
+      #   4: "caption"
+      #   5: "formula"
+      #   6: "list_item"
+      #   7: "header"
+      #   8: "footer"
+      #   9: "chart"
+      #   10: "unknown"
+      # --- end DocLayout-YOLO config ---
     ocr:
       enabled: true
       version: "PP-OCRv4"

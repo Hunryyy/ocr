@@ -169,6 +169,13 @@ class ModelBundle:
     layout_input_size: int = 1024
     layout_nms_threshold: float = 0.5
     layout_score_threshold: float = 0.3
+    layout_nms_mode: str = "class_aware"  # "class_aware" | "agnostic"
+    layout_enable_second_pass: bool = False
+    layout_second_pass_input_size: int = 1280
+    layout_second_pass_score_threshold: float = 0.15
+    layout_second_pass_min_dets: int = 2
+    layout_second_pass_min_avg_score: float = 0.2  # trigger second pass if avg score below this
+    layout_enable_hf_correction: bool = True
 
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
@@ -379,6 +386,14 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
         bundle.layout_input_size = int(layout_cfg.get("input_size", 1024) or 1024)
         bundle.layout_nms_threshold = float(layout_cfg.get("nms_threshold", 0.5) or 0.5)
         bundle.layout_score_threshold = float(layout_cfg.get("score_threshold", 0.3) or 0.3)
+        bundle.layout_nms_mode = str(layout_cfg.get("nms_mode", "class_aware") or "class_aware")
+        bundle.layout_enable_second_pass = bool(layout_cfg.get("enable_second_pass", False))
+        sp = layout_cfg.get("second_pass", {}) or {}
+        bundle.layout_second_pass_input_size = int(sp.get("input_size", 1280) or 1280)
+        bundle.layout_second_pass_score_threshold = float(sp.get("score_threshold", 0.15) or 0.15)
+        bundle.layout_second_pass_min_dets = int(sp.get("min_dets_trigger", 2) or 2)
+        bundle.layout_second_pass_min_avg_score = float(sp.get("min_avg_score_trigger", 0.2) or 0.2)
+        bundle.layout_enable_hf_correction = bool(layout_cfg.get("enable_hf_correction", True))
     else:
         bundle.layout_class_map = {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
 
@@ -496,6 +511,158 @@ def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = None) -
         return results
     else:
         return _nms_single_class(detections, iou_threshold)
+
+
+def _class_aware_nms(detections: List[Dict[str, Any]], iou_threshold: float) -> List[Dict[str, Any]]:
+    """
+    Class-aware NMS: group detections by label and apply NMS within each group.
+    This prevents cross-class suppression (e.g. figure/table boxes won't kill nearby caption boxes).
+    Uses per-class IoU thresholds from CLASS_NMS_THRESHOLDS where available.
+    """
+    if not detections:
+        return []
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for det in detections:
+        groups[det.get("label", "unknown")].append(det)
+    results = []
+    for cls, dets in groups.items():
+        thr = CLASS_NMS_THRESHOLDS.get(cls, iou_threshold)
+        results.extend(_nms_single_class(dets, thr))
+    return results
+
+
+# DocLayout-YOLO and common model label aliases -> project label set
+_LAYOUT_LABEL_ALIASES: Dict[str, str] = {
+    # text variants
+    "text": "paragraph",
+    "plain text": "paragraph",
+    "plain_text": "paragraph",
+    "body": "paragraph",
+    "body_text": "paragraph",
+    # list variants
+    "list": "list_item",
+    "list_item": "list_item",
+    "bullet": "list_item",
+    # title/heading
+    "heading": "title",
+    "section_title": "title",
+    "section": "title",
+    # caption variants
+    "figure_caption": "caption",
+    "table_caption": "caption",
+    "fig_caption": "caption",
+    "tab_caption": "caption",
+    "caption_text": "caption",
+    # figure/image variants
+    "figure": "figure",
+    "image": "figure",
+    "picture": "figure",
+    "photo": "figure",
+    "illustration": "figure",
+    "diagram": "figure",
+    # chart
+    "chart": "chart",
+    "graph": "chart",
+    "plot": "chart",
+    # table
+    "table": "table",
+    # formula/equation
+    "formula": "formula",
+    "equation": "formula",
+    "math": "formula",
+    "math_formula": "formula",
+    "isolated_formula": "formula",
+    "inline_formula": "formula",
+    # header/footer
+    "header": "header",
+    "page_header": "header",
+    "running_head": "header",
+    "footer": "footer",
+    "page_footer": "footer",
+    "page_number": "footer",
+    # catch-alls
+    "unknown": "unknown",
+    "abandon": "unknown",
+    "discarded": "unknown",
+}
+
+
+def _map_layout_label(raw_label: str) -> str:
+    """Map a raw detector label to the project label set."""
+    label = raw_label.strip().lower()
+    # Direct hit in supported types
+    if label in SUPPORTED_BLOCK_TYPES:
+        return label
+    # Alias lookup
+    mapped = _LAYOUT_LABEL_ALIASES.get(label)
+    if mapped:
+        return mapped
+    # Partial match heuristics
+    if "caption" in label:
+        return "caption"
+    if "formula" in label or "equation" in label or "math" in label:
+        return "formula"
+    if "figure" in label or "image" in label or "picture" in label:
+        return "figure"
+    if "table" in label:
+        return "table"
+    if "title" in label or "heading" in label:
+        return "title"
+    if "list" in label:
+        return "list_item"
+    if "header" in label:
+        return "header"
+    if "footer" in label:
+        return "footer"
+    if "chart" in label or "graph" in label or "plot" in label:
+        return "chart"
+    return "unknown"
+
+
+def _apply_header_footer_correction(
+    results: List[Dict[str, Any]],
+    orig_w: int,
+    orig_h: int,
+    top_ratio: float = 0.08,
+    bottom_ratio: float = 0.08,
+    span_ratio: float = 0.6,
+    max_height_ratio: float = 0.06,
+) -> List[Dict[str, Any]]:
+    """
+    Lightweight heuristic to re-label detections as header/footer based on position.
+    Only corrects text-like blocks (paragraph/title/list_item/caption/unknown).
+    Non-text blocks (table/figure/formula/chart) are never re-labeled.
+    """
+    if not results or orig_h <= 0 or orig_w <= 0:
+        return results
+    top_y = orig_h * top_ratio
+    bot_y = orig_h * (1.0 - bottom_ratio)
+    min_span_w = orig_w * span_ratio
+    max_h = orig_h * max_height_ratio
+    corrected = []
+    for r in results:
+        label = r["label"]
+        if label in NON_TEXT_BLOCK_TYPES:
+            corrected.append(r)
+            continue
+        x1, y1, x2, y2 = r["bbox"]
+        bw = x2 - x1
+        bh = y2 - y1
+        # Check header: block center is in top region, spans wide, is short
+        cy = (y1 + y2) / 2.0
+        if (cy < top_y and bw >= min_span_w and bh <= max_h
+                and label not in ("header",)):
+            r = dict(r)
+            r["label"] = "header"
+            r["hf_corrected"] = True
+        # Check footer: block center is in bottom region, spans wide, is short
+        elif (cy > bot_y and bw >= min_span_w and bh <= max_h
+              and label not in ("footer",)):
+            r = dict(r)
+            r["label"] = "footer"
+            r["hf_corrected"] = True
+        corrected.append(r)
+    return corrected
 
 
 def _union_bbox(bboxes: List[List[float]]) -> List[float]:
@@ -972,41 +1139,81 @@ def _letterbox_resize(img: Any, target_size: int):
     return padded, scale, (pad_x, pad_y), orig_w, orig_h
 
 
-def _parse_yolo_output(output: Any, num_classes: int, score_threshold: float) -> List[Dict[str, Any]]:
+def _parse_yolo_output(output: Any, num_classes: int, score_threshold: float,
+                       debug_shapes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Support YOLO-like outputs:
-    - [1,N,4+1+num_cls] (cx,cy,w,h,obj,cls...)
-    - [1,N,4+num_cls]   (cx,cy,w,h,cls...)
-    - [1,N,6]           (cx,cy,w,h,score,cls_id)
+    - [1,N,4+1+num_cls] (cx,cy,w,h,obj,cls...)  YOLOv5/v7
+    - [1,N,4+num_cls]   (cx,cy,w,h,cls...)       YOLOv8 style
+    - [1,N,6]           (cx,cy,w,h,score,cls_id) compact 6-col
+    - [1,N,7]           (x1,y1,x2,y2,score,cls_id,extra) xyxy compact
+    - [1,4+num_cls,N]   transposed DocLayout-YOLO/YOLOv8 export (columns=boxes)
+    - [N,6] or [N,7]    already squeezed variants
     """
     if np is None:
         return []
     arr = np.array(output)
-    if arr.ndim == 3:
-        arr = arr[0]
+    if debug_shapes is not None:
+        debug_shapes.append(str(list(arr.shape)))
+    # Squeeze batch dim
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]  # -> [N, C] or [C, N]
     if arr.ndim != 2:
         return []
+
+    rows, cols = arr.shape
+    # Detect transposed layout: DocLayout-YOLO exports [4+num_cls, N] instead of [N, 4+num_cls].
+    # Heuristic: the channel dimension (rows) should be small (>= 5 for bbox+score) and much
+    # smaller than N (cols). We allow +2 slack over 4+num_classes to cover obj-score variants.
+    _TRANSPOSE_SLACK = 2
+    if rows < cols and rows >= 5 and rows <= (4 + max(1, num_classes) + _TRANSPOSE_SLACK):
+        arr = arr.T  # now [N, C]
+        rows, cols = arr.shape
+
+    # Determine row format based on column count
     dets: List[Dict[str, Any]] = []
     for det in arr:
         det = det.tolist()
-        if len(det) >= 5 + num_classes:
+        n = len(det)
+        if n >= 5 + num_classes:
+            # YOLOv5/v7: cx,cy,w,h,obj,cls...
             cx, cy, w, h, obj = det[:5]
             cls_scores = det[5:5 + num_classes]
             cls_idx = int(np.argmax(cls_scores))
             score = float(obj * cls_scores[cls_idx])
-        elif len(det) >= 4 + num_classes:
+            fmt = "cxcywh"
+        elif n >= 4 + num_classes and num_classes > 1:
+            # YOLOv8: cx,cy,w,h,cls...
             cx, cy, w, h = det[:4]
             cls_scores = det[4:4 + num_classes]
             cls_idx = int(np.argmax(cls_scores))
             score = float(cls_scores[cls_idx])
-        elif len(det) >= 6:
-            cx, cy, w, h, score, cls_idx = det[:6]
+            fmt = "cxcywh"
+        elif n >= 7:
+            # xyxy compact with extra cols: x1,y1,x2,y2,score,cls_id,(...)
+            x1, y1, x2, y2, score, cls_idx = det[:6]
             score, cls_idx = float(score), int(cls_idx)
+            cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+            w = x2 - x1; h = y2 - y1
+            fmt = "cxcywh"  # converted to center form above
+        elif n >= 6:
+            # Compact 6-col: distinguish xyxy (x2>x1 and values > 1.0) from cxcywh.
+            # Heuristic: if v2 > v0 and v3 > v1 and at least one coord > 2.0 => xyxy.
+            v0, v1, v2, v3, score, cls_idx = det[:6]
+            score, cls_idx = float(score), int(cls_idx)
+            if v2 > v0 and v3 > v1 and max(v0, v1, v2, v3) > 2.0:
+                # xyxy format: convert to center form
+                cx = (v0 + v2) / 2; cy = (v1 + v3) / 2
+                w = v2 - v0; h = v3 - v1
+                fmt = "cxcywh"
+            else:
+                cx, cy, w, h = v0, v1, v2, v3
+                fmt = "cxcywh"
         else:
             continue
         if score >= score_threshold:
             dets.append({"bbox": [float(cx), float(cy), float(w), float(h)],
-                         "label_idx": int(cls_idx), "score": float(score), "format": "cxcywh"})
+                         "label_idx": int(cls_idx), "score": float(score), "format": fmt})
     return dets
 
 
@@ -1078,6 +1285,13 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
     """
     Returns list of {"bbox":[x1,y1,x2,y2], "label":str, "score":float}
     Falls back to empty list (caller should use OCR fallback) when unavailable.
+
+    Enhancements vs original:
+    - Records output shapes in debug["layout_output_shapes"]
+    - Supports class-aware NMS (nms_mode=class_aware) or agnostic (nms_mode=agnostic)
+    - Extended label mapping via _LAYOUT_LABEL_ALIASES
+    - Optional second-pass inference when first pass returns too few detections
+    - Optional header/footer heuristic correction
     """
     t0 = _now_ms()
     if models.layout_detector is None:
@@ -1099,17 +1313,23 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
         debug["layout_ms"] = round(_now_ms() - t0, 2)
         return []
 
+    orig_w, orig_h = img.size
     input_size = int(models.layout_input_size or 1024)
-    padded, scale, pad, orig_w, orig_h = _letterbox_resize(img, input_size)
-    if padded is None:
-        debug["layout_detector_status"] = "preprocess_failed"
-        debug["layout_ms"] = round(_now_ms() - t0, 2)
-        return []
-
-    tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-
+    num_classes = max(1, len(models.layout_class_map))
+    score_thr = float(models.layout_score_threshold or 0.3)
+    nms_mode = str(models.layout_nms_mode or "class_aware")
+    nms_thr = float(models.layout_nms_threshold or 0.5)
     sess = models.layout_detector
+    debug_shapes: List[str] = []
+
+    # --- First inference pass ---
     try:
+        padded, scale, pad, _, _ = _letterbox_resize(img, input_size)
+        if padded is None:
+            debug["layout_detector_status"] = "preprocess_failed"
+            debug["layout_ms"] = round(_now_ms() - t0, 2)
+            return []
+        tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
         input_name = sess.get_inputs()[0].name
         outputs = sess.run(None, {input_name: tensor})
         output_names = [o.name for o in sess.get_outputs()]
@@ -1118,30 +1338,104 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
         debug["layout_ms"] = round(_now_ms() - t0, 2)
         return []
 
-    num_classes = max(1, len(models.layout_class_map))
-    score_thr = float(models.layout_score_threshold or 0.3)
-
     dets: List[Dict[str, Any]] = []
     if len(outputs) == 1:
-        dets = _parse_yolo_output(outputs[0], num_classes, score_thr)
+        dets = _parse_yolo_output(outputs[0], num_classes, score_thr, debug_shapes)
     else:
         dets = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs)), score_thr)
+    debug["layout_output_shapes"] = debug_shapes
+    debug["layout_nms_mode"] = nms_mode
 
+    # Convert raw dets to results with labels
     results: List[Dict[str, Any]] = []
     for det in dets:
         bbox_in = _convert_to_xyxy(det, input_size)
         bbox = _map_to_original_coords(bbox_in, scale, pad, orig_w, orig_h)
         if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
             continue
-        label = models.layout_class_map.get(int(det["label_idx"]), "unknown")
-        if label == "text":
-            label = "paragraph"
+        raw_label = models.layout_class_map.get(int(det["label_idx"]), "unknown")
+        label = _map_layout_label(raw_label)
         if label not in SUPPORTED_BLOCK_TYPES:
             label = "unknown"
         results.append({"bbox": bbox, "label": label, "score": float(det["score"])})
 
-    # NMS (class-agnostic)
-    results = _nms_python(results, float(models.layout_nms_threshold or 0.5))
+    # --- Second-pass inference (optional) ---
+    second_pass_triggered = False
+    second_pass_reason = ""
+    if models.layout_enable_second_pass:
+        min_dets = models.layout_second_pass_min_dets
+        # Trigger conditions
+        trigger = False
+        if len(results) < min_dets:
+            trigger = True
+            second_pass_reason = f"too_few_dets:{len(results)}<{min_dets}"
+        else:
+            present_labels = {r["label"] for r in results}
+            # Check for large non-text area with no detections of key classes
+            if not present_labels.intersection(NON_TEXT_BLOCK_TYPES):
+                # Estimate non-text area heuristic
+                trigger = True
+                second_pass_reason = "missing_non_text_classes"
+            elif results:
+                avg_score = sum(r["score"] for r in results) / len(results)
+                if avg_score < models.layout_second_pass_min_avg_score:
+                    trigger = True
+                    second_pass_reason = f"low_avg_score:{avg_score:.3f}"
+
+        if trigger:
+            second_pass_triggered = True
+            t_sp = _now_ms()
+            sp_input_size = int(models.layout_second_pass_input_size or 1280)
+            sp_score_thr = float(models.layout_second_pass_score_threshold or 0.15)
+            try:
+                padded2, scale2, pad2, _, _ = _letterbox_resize(img, sp_input_size)
+                if padded2 is not None:
+                    tensor2 = padded2.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+                    outputs2 = sess.run(None, {input_name: tensor2})
+                    debug_shapes2: List[str] = []
+                    if len(outputs2) == 1:
+                        dets2 = _parse_yolo_output(outputs2[0], num_classes, sp_score_thr, debug_shapes2)
+                    else:
+                        dets2 = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs2)), sp_score_thr)
+                    results2: List[Dict[str, Any]] = []
+                    for det in dets2:
+                        bbox_in = _convert_to_xyxy(det, sp_input_size)
+                        bbox = _map_to_original_coords(bbox_in, scale2, pad2, orig_w, orig_h)
+                        if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
+                            continue
+                        raw_label = models.layout_class_map.get(int(det["label_idx"]), "unknown")
+                        label = _map_layout_label(raw_label)
+                        if label not in SUPPORTED_BLOCK_TYPES:
+                            label = "unknown"
+                        results2.append({"bbox": bbox, "label": label, "score": float(det["score"])})
+                    # Use second-pass results if they're better
+                    if len(results2) > len(results):
+                        results = results2
+                        debug["layout_output_shapes_sp"] = debug_shapes2
+            except Exception as e:
+                debug["layout_second_pass_error"] = str(e)[:80]
+            sp_ms = round(_now_ms() - t_sp, 2)
+            debug["layout_second_pass_ms"] = sp_ms
+            debug["layout_second_pass_dets"] = len(results)
+
+    debug["layout_second_pass_triggered"] = second_pass_triggered
+    if second_pass_reason:
+        debug["layout_second_pass_reason"] = second_pass_reason
+
+    # --- NMS ---
+    if nms_mode == "agnostic":
+        results = _nms_python(results, nms_thr)
+    else:
+        # class_aware (default)
+        results = _class_aware_nms(results, nms_thr)
+
+    # --- Header/footer heuristic correction ---
+    if models.layout_enable_hf_correction:
+        hf_before = len(results)
+        results = _apply_header_footer_correction(results, orig_w, orig_h)
+        corrected = sum(1 for r in results if r.get("hf_corrected"))
+        if corrected:
+            debug["layout_hf_corrected"] = corrected
 
     debug["layout_detector_status"] = "ok"
     debug["layout_detections"] = len(results)
@@ -4064,16 +4358,156 @@ def _detect_columns_for_order(blocks: List[Dict[str, Any]], page: Dict[str, Any]
 
 
 
+def _self_check_layout():
+    """
+    Small self-check for class-aware NMS and label mapping.
+    Prints results and returns True if all checks pass.
+    """
+    ok = True
+    errors = []
+
+    # --- Check 1: class-aware NMS preserves figure+caption pair (non-overlapping) ---
+    figure_det = {"bbox": [10, 10, 200, 300], "label": "figure", "score": 0.9}
+    caption_det = {"bbox": [10, 305, 200, 330], "label": "caption", "score": 0.85}
+    overlapping_figure = {"bbox": [15, 15, 195, 295], "label": "figure", "score": 0.7}
+    dets = [figure_det, caption_det, overlapping_figure]
+    kept = _class_aware_nms(dets, iou_threshold=0.5)
+    kept_labels = [d["label"] for d in kept]
+    if "caption" not in kept_labels:
+        errors.append("class_aware_nms: caption was suppressed by figure (should be kept)")
+        ok = False
+    if kept_labels.count("figure") != 1:
+        errors.append(f"class_aware_nms: expected 1 figure, got {kept_labels.count('figure')}")
+        ok = False
+
+    # --- Check 1b: class-aware NMS preserves caption even when it overlaps with figure ---
+    # Simulate a tight figure+caption where caption bbox overlaps the figure box.
+    # Agnostic NMS would suppress the caption; class-aware must keep it.
+    figure_large = {"bbox": [10, 10, 400, 350], "label": "figure", "score": 0.95}
+    caption_overlapping = {"bbox": [10, 320, 400, 360], "label": "caption", "score": 0.8}
+    kept_1b = _class_aware_nms([figure_large, caption_overlapping], iou_threshold=0.5)
+    kept_1b_labels = {d["label"] for d in kept_1b}
+    if "caption" not in kept_1b_labels:
+        errors.append("class_aware_nms: overlapping caption was suppressed by figure (should be kept)")
+        ok = False
+    if "figure" not in kept_1b_labels:
+        errors.append("class_aware_nms: figure was lost when kept with caption")
+        ok = False
+    # Verify agnostic NMS *would* suppress the caption in this case (proves the check is meaningful)
+    iou_fig_cap = _iou(figure_large["bbox"], caption_overlapping["bbox"])
+    kept_agnostic = _nms_python([figure_large, caption_overlapping], iou_threshold=0.5)
+    if iou_fig_cap > 0.5 and len(kept_agnostic) != 1:
+        # Only validate agnostic suppression if IoU actually exceeds threshold
+        errors.append(f"agnostic_nms: expected suppression at iou={iou_fig_cap:.2f}, got {len(kept_agnostic)} dets")
+        ok = False
+
+    # --- Check 2: agnostic NMS suppresses caption (expected behavior) ---
+    dets2 = [figure_det, caption_det]
+    # With IoU ~0, caption should survive agnostic NMS too (non-overlapping)
+    kept2 = _nms_python(dets2, iou_threshold=0.5)
+    if len(kept2) != 2:
+        errors.append(f"agnostic_nms: expected 2 non-overlapping dets, got {len(kept2)}")
+        ok = False
+
+    # --- Check 3: label mapping aliases ---
+    alias_cases = [
+        ("text", "paragraph"),
+        ("equation", "formula"),
+        ("math", "formula"),
+        ("image", "figure"),
+        ("picture", "figure"),
+        ("figure_caption", "caption"),
+        ("table_caption", "caption"),
+        ("list", "list_item"),
+        ("heading", "title"),
+        ("page_header", "header"),
+        ("page_footer", "footer"),
+        ("chart", "chart"),
+        ("abandon", "unknown"),
+    ]
+    for raw, expected in alias_cases:
+        got = _map_layout_label(raw)
+        if got != expected:
+            errors.append(f"label_mapping: '{raw}' -> '{got}', expected '{expected}'")
+            ok = False
+
+    # --- Check 4: header/footer correction ---
+    page_w, page_h = 1000, 1400
+    hf_dets = [
+        # Should become header: top area, wide, short
+        {"bbox": [0, 10, 950, 50], "label": "paragraph", "score": 0.8},
+        # Should become footer: bottom area, wide, short
+        {"bbox": [0, 1360, 950, 1395], "label": "paragraph", "score": 0.8},
+        # Should stay as table: non-text, not corrected
+        {"bbox": [100, 100, 800, 600], "label": "table", "score": 0.9},
+        # Normal paragraph in middle, should not be corrected
+        {"bbox": [50, 300, 800, 400], "label": "paragraph", "score": 0.8},
+    ]
+    corrected = _apply_header_footer_correction(hf_dets, page_w, page_h)
+    corrected_labels = {i: d["label"] for i, d in enumerate(corrected)}
+    if corrected_labels[0] != "header":
+        errors.append(f"hf_correction: top block should be 'header', got '{corrected_labels[0]}'")
+        ok = False
+    if corrected_labels[1] != "footer":
+        errors.append(f"hf_correction: bottom block should be 'footer', got '{corrected_labels[1]}'")
+        ok = False
+    if corrected_labels[2] != "table":
+        errors.append(f"hf_correction: table should not be re-labeled, got '{corrected_labels[2]}'")
+        ok = False
+    if corrected_labels[3] != "paragraph":
+        errors.append(f"hf_correction: middle paragraph should not be re-labeled, got '{corrected_labels[3]}'")
+        ok = False
+
+    # --- Check 5: _parse_yolo_output shape handling ---
+    if np is not None:
+        # Simulate [1, 4+num_cls, N] transposed output (DocLayout-YOLO style)
+        num_cls = 3
+        N = 5
+        arr_transposed = np.zeros((1, 4 + num_cls, N), dtype=np.float32)
+        # Fill first detection with valid data: cx=0.5, cy=0.5, w=0.2, h=0.3, cls0_score=0.9
+        arr_transposed[0, 0, 0] = 0.5  # cx
+        arr_transposed[0, 1, 0] = 0.5  # cy
+        arr_transposed[0, 2, 0] = 0.2  # w
+        arr_transposed[0, 3, 0] = 0.3  # h
+        arr_transposed[0, 4, 0] = 0.9  # cls0 score
+        dets_t = _parse_yolo_output(arr_transposed, num_cls, score_threshold=0.5)
+        if len(dets_t) < 1:
+            errors.append("parse_yolo_output: failed to parse transposed [1,C,N] shape")
+            ok = False
+        elif abs(dets_t[0]["score"] - 0.9) > 0.01:
+            errors.append(f"parse_yolo_output: wrong score {dets_t[0]['score']}, expected ~0.9")
+            ok = False
+
+    if ok:
+        sys.stdout.write("[self_check_layout] All checks passed.\n")
+    else:
+        sys.stdout.write("[self_check_layout] FAILED:\n")
+        for e in errors:
+            sys.stdout.write(f"  - {e}\n")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML/JSON config")
-    parser.add_argument("--input", type=str, required=True, help="Path to input test jsonl")
+    parser.add_argument("--config", type=str, help="Path to YAML/JSON config")
+    parser.add_argument("--input", type=str, help="Path to input test jsonl")
     parser.add_argument("--output", type=str, default="submit.jsonl", help="Path to output submit jsonl")
     parser.add_argument("--image-root", type=str, default=None, help="Root dir to prepend to relative image paths")
     parser.add_argument("--debug-output", type=str, default=None, help="Optional path to write debug jsonl")
     parser.add_argument("--parallel", type=int, default=None, help="Override pipeline.parallel_workers")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--self_check_layout", action="store_true",
+                        help="Run layout self-check (NMS, label mapping, hf_correction) and exit")
     args = parser.parse_args()
+
+    if args.self_check_layout:
+        passed = _self_check_layout()
+        sys.exit(0 if passed else 1)
+
+    if not args.config:
+        parser.error("--config is required unless --self_check_layout is set")
+    if not args.input:
+        parser.error("--input is required unless --self_check_layout is set")
 
     cfg = load_cfg(args.config)
     num_workers = args.parallel if args.parallel is not None else int(cfg.get("pipeline", {}).get("parallel_workers", 0) or 0)

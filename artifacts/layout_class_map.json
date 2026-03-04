@@ -1,0 +1,31 @@
+{
+  "_comment": "DocLayout-YOLO class index -> project label mapping template.",
+  "_usage": [
+    "Copy this file and adjust indices to match your model's class order.",
+    "Set 'class_map_path' in config to the path of your adjusted file,",
+    "or inline the mapping under models.fallback_models.layout_detector.class_map.",
+    "Supported project labels: title/paragraph/list_item/caption/table/figure/formula/header/footer/chart/unknown.",
+    "Common DocLayout-YOLO class names (text/equation/image/...) are auto-mapped via _LAYOUT_LABEL_ALIASES in eval.py.",
+    "You can also use the raw model class names as values and they will be resolved via the alias table."
+  ],
+  "_export_command": [
+    "# Export DocLayout-YOLO to ONNX (requires the doclayout_yolo package, install via pip):",
+    "# pip install doclayout-yolo ultralytics",
+    "# from doclayout_yolo import YOLOv10",
+    "# model = YOLOv10('doclayout_yolo_docstructbench_imgsz1024.pt')",
+    "# model.export(format='onnx', imgsz=1024, opset=12)",
+    "# Note: exact import path may vary by package version; consult the DocLayout-YOLO repo README.",
+    "# Resulting .onnx file should be ≤150MB for the nano/small variants."
+  ],
+  "0": "title",
+  "1": "paragraph",
+  "2": "table",
+  "3": "figure",
+  "4": "caption",
+  "5": "formula",
+  "6": "list_item",
+  "7": "header",
+  "8": "footer",
+  "9": "chart",
+  "10": "unknown"
+}
