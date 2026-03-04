@@ -311,12 +311,24 @@ def _maybe_load_paddle(cfg: Dict[str, Any]):
         return None
 
 
-def _load_layout_class_map(cfg_map: Optional[Dict]) -> Dict[int, str]:
+def _load_layout_class_map(cfg_map) -> Dict[int, str]:
     """
-    Handle int->str, str->int, str->str (int keys as strings).
+    Handle:
+    - str path to a JSON file (e.g. "models/layout_class_map.json")
+    - dict with int->str, str->int, or str->str (int keys as strings) mappings
     """
     if not cfg_map:
         return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
+    # Support file-path string
+    if isinstance(cfg_map, str):
+        if os.path.exists(cfg_map):
+            try:
+                with open(cfg_map, "r", encoding="utf-8") as _f:
+                    cfg_map = json.load(_f)
+            except Exception:
+                return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
+        else:
+            return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
     result: Dict[int, str] = {}
     for k, v in cfg_map.items():
         if isinstance(k, int) and isinstance(v, str):
@@ -1221,6 +1233,12 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
     """
     Returns list of {"bbox":[x1,y1,x2,y2], "label":str, "score":float}
     Falls back to empty list (caller should use OCR fallback) when unavailable.
+
+    Supports:
+    - class-aware NMS by default (nms_mode="class_aware") to avoid suppressing
+      nearby different-class boxes (e.g. caption next to figure/table).
+    - optional header/footer post-hoc refinement (hf_refine_enabled=True).
+    - optional second-pass at higher resolution for difficult/sparse pages.
     """
     t0 = _now_ms()
     if models.layout_detector is None:
