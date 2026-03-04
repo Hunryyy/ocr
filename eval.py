@@ -47,6 +47,13 @@ try:
 except ImportError:  # pragma: no cover
     Image = None
 
+try:
+    from utils.formula import FormulaRecognizer, normalize_latex, preprocess_formula_image
+except Exception:  # pragma: no cover
+    FormulaRecognizer = None  # type: ignore[assignment,misc]
+    normalize_latex = None  # type: ignore[assignment]
+    preprocess_formula_image = None  # type: ignore[assignment]
+
 
 # -----------------------------------------------------------------------------
 # Constants / type sets
@@ -1984,13 +1991,75 @@ def _extract_tables(blocks: List[Dict[str, Any]], ocr_lines: List[Dict[str, Any]
 
 
 # -----------------------------------------------------------------------------
-# Formula handling (placeholder for future latex OCR)
+# Formula handling: multi-engine recognition with fallback
 # -----------------------------------------------------------------------------
-def _process_formula_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _process_formula_blocks(
+    blocks: List[Dict[str, Any]],
+    img_path: Optional[str] = None,
+    page: Optional[Dict[str, Any]] = None,
+    models: Optional[Any] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Populate ``latex`` field for every formula block.
+
+    When *img_path* and *models* are provided the function crops each formula
+    ROI from the page image, pre-processes it, then runs :class:`FormulaRecognizer`
+    (RapidLatexOCR → pix2tex → PaddleOCR fallback).  The recognised string is
+    normalised with :func:`normalize_latex` before being stored.
+
+    When no image / recognizer is available the field is left as an empty string
+    so downstream rendering remains safe.
+    """
+    # Build a recognizer if the utils module is available
+    recognizer = None
+    if FormulaRecognizer is not None and models is not None:
+        ocr_engine = getattr(models, "ocr_engine", None)
+        recognizer = FormulaRecognizer(ocr_engine=ocr_engine, cfg=cfg or {})
+
+    page = page or {}
+    page_w = int(page.get("width", 0) or 0)
+    page_h = int(page.get("height", 0) or 0)
+
+    # Open the page image once (reused for all formula crops)
+    pil_page = None
+    if recognizer is not None and img_path and Image is not None:
+        try:
+            pil_page = Image.open(img_path).convert("RGB")
+        except Exception:
+            pil_page = None
+
     for b in blocks:
-        if b.get("type") == "formula":
-            if "latex" not in b or b.get("latex") is None:
-                b["latex"] = ""
+        if b.get("type") != "formula":
+            continue
+        # Keep existing non-empty latex (e.g. from upstream label)
+        existing = b.get("latex")
+        if existing:
+            if normalize_latex is not None:
+                b["latex"] = normalize_latex(str(existing))
+            continue
+
+        # Try to recognise from image ROI
+        latex = ""
+        if recognizer is not None and pil_page is not None and np is not None:
+            try:
+                bbox = b.get("bbox", [])
+                if len(bbox) == 4:
+                    x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    if page_w > 0:
+                        x2 = min(page_w, x2)
+                    if page_h > 0:
+                        y2 = min(page_h, y2)
+                    if x2 > x1 and y2 > y1:
+                        roi = pil_page.crop((x1, y1, x2, y2))
+                        roi_arr = np.array(roi)
+                        latex = recognizer.recognize(roi_arr)
+            except Exception:
+                latex = ""
+
+        b["latex"] = latex if latex else ""
+
     return blocks
 
 
@@ -2447,7 +2516,7 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     - 图像: <div class="image" data-bbox="x1 y1 x2 y2"></div>
     - 图表: <div class="chart" data-bbox="x1 y1 x2 y2"></div>
     - 表格: <div class="table" data-bbox="x1 y1 x2 y2"><table>...</table></div>
-    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2" data-latex="..."></div>
+    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2">LATEX</div>
     - 列表项: <div class="list_item" data-bbox="x1 y1 x2 y2">文本</div>
     - 标题说明: <div class="caption" data-bbox="x1 y1 x2 y2">文本</div>
     - 页眉: <div class="header" data-bbox="x1 y1 x2 y2">文本</div>
@@ -2490,17 +2559,12 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
         table_content = _render_table_content(table_obj or {})
         return f'<div class="table" data-bbox="{bbox_str}">{table_content}</div>'
     
-    # 公式
+    # 公式 – LaTeX as element text content (no data-latex attribute)
     if btype == "formula":
         latex = b.get("latex") or ""
-        latex = latex.strip()
-        if latex:
-            # 有 LaTeX 内容时添加 data-latex 属性
-            latex_escaped = _escape(latex)
-            return f'<div class="formula" data-bbox="{bbox_str}" data-latex="{latex_escaped}"></div>'
-        else:
-            # 无法识别 LaTeX 时忽略该属性
-            return f'<div class="formula" data-bbox="{bbox_str}"></div>'
+        latex = normalize_latex(latex) if normalize_latex is not None else latex.strip()
+        latex_escaped = _escape(latex)
+        return f'<div class="formula" data-bbox="{bbox_str}">{latex_escaped}</div>'
     
     # 页眉
     if btype == "header":
@@ -2723,7 +2787,7 @@ def process_one(sample: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle
 
     # 6) Formula blocks
     try:
-        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path=img_path, page=page, models=models, cfg=cfg)
     except Exception as e:
         debug["formula_error"] = str(e)[:200]
 
@@ -2861,7 +2925,7 @@ def _run_fallback(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle, 
 
     # 3) tables + formulas
     ir["tables"] = _extract_tables(ir.get("blocks", []), ocr_lines, img_path, ir.get("page", {}), cfg, models, debug)
-    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path=img_path, page=ir.get("page", {}), models=models, cfg=cfg)
 
     debug["fallback_ms"] = round(_now_ms() - t0, 2)
     return ir, ocr_lines
