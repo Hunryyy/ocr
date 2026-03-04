@@ -49,6 +49,24 @@ try:
 except ImportError:  # pragma: no cover
     Image = None
 
+try:
+    from utils.formula import normalize_latex, preprocess_formula_image, FormulaRecognizer
+    _FORMULA_MODULE_OK = True
+except ImportError:  # pragma: no cover
+    _FORMULA_MODULE_OK = False
+    def normalize_latex(latex: str) -> str:  # type: ignore[misc]
+        latex = (latex or "").strip()
+        if latex.startswith("$$") and latex.endswith("$$") and len(latex) >= 4:
+            latex = latex[2:-2].strip()
+        elif latex.startswith("$") and latex.endswith("$") and len(latex) >= 2:
+            latex = latex[1:-1].strip()
+        import re as _re
+        latex = _re.sub(r"\\displaystyle\s*", "", latex)
+        latex = _re.sub(r"\s+", " ", latex)
+        latex = latex.replace("\u2212", "-")
+        latex = latex.replace("\u00d7", r"\times ")
+        return latex.strip()
+
 
 # -----------------------------------------------------------------------------
 # Constants / type sets
@@ -153,6 +171,9 @@ class ModelBundle:
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
     model_disabled_reason: List[str] = field(default_factory=list)
+
+    # Formula recognizer
+    formula_recognizer: Any = None
 
 
 # -----------------------------------------------------------------------------
@@ -340,6 +361,13 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
 
     # ---- OCR ----
     bundle.ocr_engine = _maybe_load_paddle(cfg)
+
+    # ---- formula recognizer ----
+    if _FORMULA_MODULE_OK:
+        try:
+            bundle.formula_recognizer = FormulaRecognizer(paddle_ocr=bundle.ocr_engine)
+        except Exception:
+            bundle.formula_recognizer = None
 
     # ---- layout detector ----
     layout_cfg = (fallback_cfg.get("layout_detector") or models_cfg.get("layout_detector") or {}) or {}
@@ -2145,96 +2173,36 @@ def _extract_tables(blocks: List[Dict[str, Any]], ocr_lines: List[Dict[str, Any]
 
 
 # -----------------------------------------------------------------------------
-# Formula handling (placeholder for future latex OCR)
+# Formula handling
 # -----------------------------------------------------------------------------
-def _process_formula_blocks(blocks: List[Dict[str, Any]], img_path: str = "",
-                            page: Optional[Dict[str, Any]] = None,
-                            cfg: Optional[Dict[str, Any]] = None,
-                            models: Optional[Any] = None) -> List[Dict[str, Any]]:
+def _process_formula_blocks(
+    blocks: List[Dict[str, Any]],
+    img_path: Optional[str] = None,
+    recognizer: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """
-    为公式块填充 LaTeX 内容。
-    
-    优先级:
-    1. 块已有 latex 字段 -> 直接使用
-    2. 尝试 rapid_latex_ocr / pix2tex 专用公式 OCR
-    3. 使用 PaddleOCR 对公式区域进行普通 OCR，用 $...$ 包裹
-    4. 降级为空字符串
+    处理所有 formula 类型 block：
+    - 若 latex 未设置，尝试用 FormulaRecognizer 识别（需要 img_path）
+    - 规范化 latex 字符串
+    - 保证 latex 字段存在（识别失败时为空字符串，保留结构）
     """
-    formula_blocks = [b for b in blocks if b.get("type") == "formula"
-                      and not (b.get("latex") or b.get("text"))]
-    if not formula_blocks:
-        return blocks
-
-    # 尝试专用公式 OCR 引擎
-    _rapid_latex_ocr = None
-    try:
-        from rapid_latex_ocr import LatexOCR
-        _rapid_latex_ocr = LatexOCR()
-    except Exception:
-        pass
-
-    if _rapid_latex_ocr is None:
-        try:
-            from pix2tex.cli import LatexOCR as Pix2TexOCR
-            _rapid_latex_ocr = Pix2TexOCR()
-        except Exception:
-            pass
-
-    for b in formula_blocks:
-        latex = ""
-        bbox = b.get("bbox", [])
-        # 尝试专用公式 OCR
-        if _rapid_latex_ocr is not None and img_path and bbox and len(bbox) >= 4:
-            try:
-                img = Image.open(img_path).convert("RGB")
-                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                crop = img.crop((x1, y1, x2, y2))
-                result = _rapid_latex_ocr(crop)
-                if isinstance(result, tuple) and result:
-                    latex = str(result[0] or "")
-                elif result is not None:
-                    latex = str(result)
-            except Exception:
-                pass
-
-        # 如果专用 OCR 无结果，使用 PaddleOCR 普通 OCR 并用 $...$ 包裹
-        if not latex and img_path and bbox and len(bbox) >= 4:
-            try:
-                paddle_engine = _init_paddle_ocr()
-                if paddle_engine is not None:
-                    img = Image.open(img_path).convert("RGB")
-                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                    crop = img.crop((x1, y1, x2, y2))
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                        tmp_path = tmp.name
-                        crop.save(tmp_path)
-                    try:
-                        ocr_result = paddle_engine.ocr(tmp_path, cls=False)
-                        texts = []
-                        if ocr_result:
-                            for line in ocr_result:
-                                if line:
-                                    for item in line:
-                                        if item and len(item) >= 2 and item[1]:
-                                            texts.append(item[1][0])
-                        if texts:
-                            latex = "$" + " ".join(texts) + "$"
-                    finally:
-                        try:
-                            os.unlink(tmp_path)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        if latex:
-            b["latex"] = latex
-
-    # Ensure all formula blocks have at least empty string
     for b in blocks:
-        if b.get("type") == "formula":
-            if not b.get("latex") and not b.get("text"):
-                b["latex"] = ""
+        if b.get("type") != "formula":
+            continue
+        raw = b.get("latex") or ""
+        # 若没有 latex 且有图片路径与识别器，尝试识别
+        if raw == "" and img_path and recognizer is not None and Image is not None:
+            try:
+                page_img = Image.open(img_path).convert("RGB")
+                bbox = b.get("bbox", [])
+                if len(bbox) == 4:
+                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    roi = page_img.crop((x1, y1, x2, y2))
+                    raw = recognizer.recognize(roi)
+            except Exception:
+                raw = ""
+        # Normalize and store
+        b["latex"] = normalize_latex(raw)
     return blocks
 
 # -----------------------------------------------------------------------------
@@ -2669,7 +2637,7 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     - 图像: <div class="image" data-bbox="x1 y1 x2 y2"></div>
     - 图表: <div class="chart" data-bbox="x1 y1 x2 y2"></div>
     - 表格: <div class="table" data-bbox="x1 y1 x2 y2"><table>...</table></div>
-    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2" data-latex="..."></div>
+    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2">latex</div>
     - 列表项: <div class="list_item" data-bbox="x1 y1 x2 y2">文本</div>
     - 标题说明: <div class="caption" data-bbox="x1 y1 x2 y2">文本</div>
     - 页眉: <div class="header" data-bbox="x1 y1 x2 y2">文本</div>
@@ -2938,7 +2906,11 @@ def process_one(sample: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle
 
     # 6) Formula blocks
     try:
-        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path, page, cfg, models)
+        ir["blocks"] = _process_formula_blocks(
+            ir.get("blocks", []),
+            img_path=img_path,
+            recognizer=getattr(models, "formula_recognizer", None),
+        )
     except Exception as e:
         debug["formula_error"] = str(e)[:200]
 
@@ -3076,7 +3048,11 @@ def _run_fallback(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle, 
 
     # 3) tables + formulas
     ir["tables"] = _extract_tables(ir.get("blocks", []), ocr_lines, img_path, ir.get("page", {}), cfg, models, debug)
-    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path, ir.get("page", {}), cfg, models)
+    ir["blocks"] = _process_formula_blocks(
+        ir.get("blocks", []),
+        img_path=img_path,
+        recognizer=getattr(models, "formula_recognizer", None),
+    )
 
     debug["fallback_ms"] = round(_now_ms() - t0, 2)
     return ir, ocr_lines
