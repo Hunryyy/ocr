@@ -2643,10 +2643,10 @@ def _render_table_content(table_obj: Dict[str, Any]) -> str:
     评测要求: <table><tr><td>文本</td></tr></table>（不要 thead/tbody）
     """
     rows = table_obj.get("rows", [])
-    
+
     if not rows:
         return "<table><tr><td></td></tr></table>"
-    
+
     parts = ["<table>"]
     for row in rows:
         parts.append("<tr>")
