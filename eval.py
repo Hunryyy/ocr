@@ -2378,59 +2378,38 @@ def _bbox_attr(bbox: List[float]) -> str:
 
 def _render_table_cell(cell: Dict[str, Any]) -> str:
     """渲染单个表格单元格"""
-    bbox_str = _bbox_attr(cell.get("bbox", []))
     rowspan = int(cell.get("rowspan", 1) or 1)
     colspan = int(cell.get("colspan", 1) or 1)
     text = _escape(cell.get("text", "") or "")
     
-    attrs = [f'data-bbox="{bbox_str}"']
+    attrs = []
     if rowspan > 1:
         attrs.append(f'rowspan="{rowspan}"')
     if colspan > 1:
         attrs.append(f'colspan="{colspan}"')
     
-    return f'<td {" ".join(attrs)}>{text}</td>'
+    if attrs:
+        return f'<td {" ".join(attrs)}>{text}</td>'
+    return f'<td>{text}</td>'
 
 
 def _render_table_content(table_obj: Dict[str, Any]) -> str:
     """
-    渲染表格内部结构 (thead + tbody)
-    
-    评测要求: <table><thead>...</thead><tbody>...</tbody></table>
+    渲染表格内部结构
+
+    输出格式: <table><tr>...</tr>...</table>（不包含 thead/tbody）
     """
     rows = table_obj.get("rows", [])
-    
+
     if not rows:
-        # 空表格: 至少输出一个空行
-        return "<table><thead><tr><td></td></tr></thead><tbody></tbody></table>"
-    
-    # 分离表头和表体
-    # 策略: 第一行作为表头，其余作为表体
-    thead_rows = rows[:1] if rows else []
-    tbody_rows = rows[1:] if len(rows) > 1 else []
-    
+        return "<table><tr><td></td></tr></table>"
+
     parts = ["<table>"]
-    
-    # 渲染 thead
-    parts.append("<thead>")
-    for row in thead_rows:
+    for row in rows:
         parts.append("<tr>")
         for cell in row:
             parts.append(_render_table_cell(cell))
         parts.append("</tr>")
-    if not thead_rows:
-        parts.append("<tr><td></td></tr>")
-    parts.append("</thead>")
-    
-    # 渲染 tbody
-    parts.append("<tbody>")
-    for row in tbody_rows:
-        parts.append("<tr>")
-        for cell in row:
-            parts.append(_render_table_cell(cell))
-        parts.append("</tr>")
-    parts.append("</tbody>")
-    
     parts.append("</table>")
     return "".join(parts)
 
