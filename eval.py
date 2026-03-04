@@ -2243,6 +2243,8 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
                                        median_gap=_page_median_gap)
             dist = float(feats.get("center_dist_norm", 0.5))
             base = 1.0 / (1.0 + dist * 2.0)
+            # same_column_id is the accurate projection-based check (preferred);
+            # same_column is a geometric heuristic fallback (weaker boost).
             if feats.get("same_column_id", 0) > 0.5 and feats.get("is_above", 0) > 0.5:
                 base *= 1.5
             elif feats.get("same_column", 0) > 0.5 and feats.get("is_above", 0) > 0.5:

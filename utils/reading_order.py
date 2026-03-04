@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import numpy as np
 except ImportError:  # pragma: no cover
-    np = None  # type: ignore
+    np = None  # type: ignore  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
