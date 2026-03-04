@@ -24,7 +24,10 @@ python ./trainer/dataset/preprocess.py \
     --output-val "$WORK_DIR/val.jsonl" \
     --image-root "$IMAGE_ROOT" \
     --train-ratio 0.9 \
-    --seed 42
+    --seed 42 \
+    --enable-ocr \
+    --ocr-use-gpu \
+    --profile accurate
 
 echo "==== [Step 2/3] 训练 LightGBM 模型 (Schema 2.0) ===="
 # 对照 train.py 实际参数名: --train, --val, --out-dir
