@@ -1,0 +1,31 @@
+{
+  "_comment": "DocLayout-YOLO class-index → canonical label mapping.",
+  "_canonical_labels": [
+    "paragraph", "title", "list_item", "caption",
+    "table", "figure", "formula", "header", "footer", "chart", "unknown"
+  ],
+  "_synonyms_handled_automatically": {
+    "text": "paragraph",
+    "equation": "formula",
+    "math": "formula",
+    "image": "figure",
+    "picture": "figure",
+    "figure_caption": "caption",
+    "table_caption": "caption"
+  },
+  "_export_command": "yolo export model=doclayout_yolo.pt format=onnx imgsz=1024 opset=12 dynamic=False",
+  "_expected_output_shape": "[1, N, 4+num_classes]  (YOLOv8-style: cx,cy,w,h,cls0,...,clsN-1)",
+  "_weight_size_note": "Model weights must be <=150MB. Do NOT commit .onnx/.pt files to git.",
+
+  "0": "title",
+  "1": "paragraph",
+  "2": "figure",
+  "3": "figure_caption",
+  "4": "table",
+  "5": "table_caption",
+  "6": "header",
+  "7": "footer",
+  "8": "formula",
+  "9": "list_item",
+  "10": "chart"
+}
