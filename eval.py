@@ -8,6 +8,7 @@ import html
 import hashlib
 import random
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -425,7 +426,20 @@ def _iou(box1: List[float], box2: List[float]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+CLASS_NMS_THRESHOLDS = {
+    "table": 0.3,
+    "figure": 0.3,
+    "image": 0.3,
+    "paragraph": 0.5,
+    "formula": 0.4,
+    "title": 0.4,
+    "header": 0.4,
+    "footer": 0.4,
+}
+DEFAULT_NMS_THRESHOLD = 0.45
+
+
+def _nms_single_class(detections: List[Dict[str, Any]], iou_threshold: float) -> List[Dict[str, Any]]:
     if not detections:
         return []
     dets = sorted(detections, key=lambda x: float(x.get("score", 0.0)), reverse=True)
@@ -435,6 +449,22 @@ def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) ->
         keep.append(best)
         dets = [d for d in dets if _iou(best["bbox"], d["bbox"]) < iou_threshold]
     return keep
+
+
+def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = None) -> List[Dict[str, Any]]:
+    if not detections:
+        return []
+    if iou_threshold is None:
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for det in detections:
+            groups[det.get("type", det.get("label", "unknown"))].append(det)
+        results = []
+        for cls, dets in groups.items():
+            threshold = CLASS_NMS_THRESHOLDS.get(cls, DEFAULT_NMS_THRESHOLD)
+            results.extend(_nms_single_class(dets, threshold))
+        return results
+    else:
+        return _nms_single_class(detections, iou_threshold)
 
 
 def _union_bbox(bboxes: List[List[float]]) -> List[float]:
@@ -528,7 +558,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -643,8 +673,8 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
     
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致
@@ -728,6 +758,33 @@ def _vectorize(feat_dict: Dict[str, float], schema: List[str], strict: bool = Fa
     if warn_missing and missing and len(missing) > len(schema) * 0.1:
         sys.stderr.write(f"[warn] {len(missing)}/{len(schema)} features missing in vectorization\n")
     return vec
+
+
+# -----------------------------------------------------------------------------
+# OCR post-processing
+# -----------------------------------------------------------------------------
+def postprocess_ocr_text(text: str, block_type: str = "paragraph") -> str:
+    """OCR 文本后处理"""
+    if not text:
+        return text
+
+    # 1. 去除多余空白
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = text.strip()
+
+    # 2. 中英文之间加空格
+    text = re.sub(r'([a-zA-Z0-9])([\u4e00-\u9fff])', r'\1 \2', text)
+    text = re.sub(r'([\u4e00-\u9fff])([a-zA-Z0-9])', r'\1 \2', text)
+
+    # 3. 修复常见 OCR 错误字符
+    text = text.replace('\u2014', '-')
+    text = text.replace('\u2026', '...')
+    text = text.replace('\u00a0', ' ')  # non-breaking space
+
+    # 4. 去除控制字符
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+    return text
 
 
 # -----------------------------------------------------------------------------
@@ -1088,7 +1145,7 @@ def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, deb
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -1188,7 +1245,7 @@ def _ocr_roi(img_path: str, roi_bbox: List[float], cfg: Dict[str, Any], models: 
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs) + x1), float(min(ys) + y1), float(max(xs) + x1), float(max(ys) + y1)]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -3132,7 +3189,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -3231,8 +3288,8 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
     
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致

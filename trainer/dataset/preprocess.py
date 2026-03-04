@@ -84,7 +84,8 @@ PAIR_FEAT_DIM = 34
 TEXT_BLOCK_TYPES = {"paragraph", "title", "list_item", "caption", "header", "footer"}
 NON_TEXT_BLOCK_TYPES = {"table", "figure", "chart", "formula"}
 TAG_WHITELIST = {f"h{i}" for i in range(1, 7)} | {
-    "p", "li", "figcaption", "figure", "table", "span", "header", "footer"
+    "p", "li", "figcaption", "figure", "table", "span", "header", "footer",
+    "div", "img", "br", "thead", "tbody", "tr", "th", "td",
 }
 
 # Caption 关键词正则（多语言、多格式支持）
@@ -151,6 +152,35 @@ def clamp_bbox(bbox, w, h) -> Optional[List[int]]:
     return [x1, y1, x2, y2]
 
 
+CLASS_TO_TYPE = {
+    "image": "image",
+    "figure": "image",
+    "chart": "chart",
+    "formula": "formula",
+    "equation": "formula",
+    "header": "header",
+    "footer": "footer",
+    "page_number": "page_number",
+    "page-number": "page_number",
+    "list_item": "list_item",
+    "list-item": "list_item",
+    "caption": "caption",
+    "table": "table",
+    "paragraph": "paragraph",
+    "text": "paragraph",
+    "title": "title",
+    "heading": "title",
+    "seal": "seal",
+    "handwriting": "handwriting",
+    "code": "code",
+    "toc": "toc",
+    "reference": "reference",
+    "abstract": "abstract",
+    "footnote": "footnote",
+    "watermark": "watermark",
+}
+
+
 def detect_block_type(el) -> Tuple[str, Optional[int]]:
     tag = el.tag.lower()
     if tag in [f"h{i}" for i in range(1, 7)]:
@@ -165,12 +195,20 @@ def detect_block_type(el) -> Tuple[str, Optional[int]]:
         return "figure", None
     if tag == "table":
         return "table", None
-    if "formula" in el.get("class", ""):
-        return "formula", None
     if tag == "header":
         return "header", None
     if tag == "footer":
         return "footer", None
+    if tag == "div":
+        classes = el.get("class", "").split()
+        for cls in classes:
+            mapped = CLASS_TO_TYPE.get(cls, None)
+            if mapped is not None:
+                return mapped, None
+        return "paragraph", None
+    cls_list = el.get("class", "").split()
+    if "formula" in cls_list or "equation" in cls_list:
+        return "formula", None
     return "unknown", None
 
 # ---------- 公式LaTeX处理增强（BLEU指标优化） ----------
