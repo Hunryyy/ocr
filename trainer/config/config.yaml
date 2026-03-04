@@ -1,0 +1,58 @@
+# ============================================================================
+# 多模态文档解析流水线配置文件 - 性能优化版
+# ============================================================================
+
+profile: "balanced"
+
+io:
+  image_root: "./data/images"
+  output_dir: "./output"
+  cache_dir: "./cache"
+  enable_cache: true               # 笔记本运行必开，避免重复 OCR
+  log_level: "INFO"
+
+runtime:
+  device: "auto"
+  num_workers: 2                   # 针对 ThinkBook 内存保护，不建议调高
+  use_fp16: true
+  lazy_load_fallback: true         # 只有逻辑模型失效时才加载检测器
+
+models:
+  # 必须与 train.py 生成的文件名严格一致
+  logic_models:
+    block_classifier: "block_classifier.json"
+    relation_scorer: "relation_scorer_order.json" # 修正：日志显示生成的是这个名字
+    relation_scorer_caption: "relation_scorer_caption.json"
+  
+  feature_schemas:
+    block: "feature_schema_block.json"
+    pair: "feature_schema_pair.json"
+    label_map: "label_map.json"
+
+  fallback_models:
+    layout_detector:
+      enabled: true
+      type: "yolo"
+      version: "yolov8n"
+      score_threshold: 0.25
+    ocr:
+      enabled: true
+      version: "PP-OCRv4"
+      lang: "ch"
+
+decode:
+  k_order: 12                      # 增加搜索邻域，提升 Recall
+  k_caption: 5
+  use_beam_search: true
+  beam_width: 5                    # 增加束搜索宽度，优化顺序
+  
+  # 关键优化：针对你 0.41 的召回率，降低阈值
+  order_score_threshold: 0.20     
+  caption_score_threshold: 0.35
+
+  fallback_trigger:
+    enabled: true
+    min_blocks: 999
+    max_empty_text_block_ratio: 0.0
+    trigger_detector: true
+    trigger_ocr: true
