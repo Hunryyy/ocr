@@ -36,12 +36,30 @@ try:
 except ImportError:
     cKDTree = None
 
+try:
+    import os as _os
+    import sys as _sys
+    _utils_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _utils_dir not in _sys.path:
+        _sys.path.insert(0, _utils_dir)
+    from utils.reading_order import (
+        detect_columns_by_projection,
+        assign_block_columns,
+        compute_page_median_gap,
+    )
+    _HAS_READING_ORDER_UTILS = True
+except Exception:
+    _HAS_READING_ORDER_UTILS = False
+    detect_columns_by_projection = None  # type: ignore
+    assign_block_columns = None  # type: ignore
+    compute_page_median_gap = None  # type: ignore
+
 
 # =============================================================================
 # 常量与 Schema 定义
 # =============================================================================
 
-SCHEMA_VERSION = "2.0"  # Bump for new features
+SCHEMA_VERSION = "2.1"  # PR4: projection-based column detection, 7 new pair features
 
 LABEL_MAP = [
     "title", "paragraph", "list_item", "caption", "table", "figure",
@@ -145,11 +163,20 @@ PAIR_SCHEMA = [
     ("v_column_id", "float32"),         # v 的栏 ID
     ("column_count", "float32"),        # 页面栏数
     ("text_line_count_ratio", "float32"), # v_lines / u_lines
+
+    # ===== PR4 新增特征（7个） =====
+    ("vertical_gap_to_median_ratio", "float32"),  # (v.y1 - u.y2) / median_gap
+    ("horizontal_gap_norm", "float32"),           # abs(v.cx - u.cx) / page_width
+    ("column_distance", "float32"),               # abs(u.col - v.col)
+    ("indent_diff_norm", "float32"),              # (v.x1 - u.x1) / page_width
+    ("width_ratio", "float32"),                   # v.w / (u.w + 1)
+    ("u_is_cross_column", "float32"),             # u 是否跨栏（宽 > 0.7 * page_w）
+    ("header_footer_penalty", "float32"),         # 是否 header/footer
 ]
 
 # 特征维度常量
 BLOCK_FEAT_DIM = len(BLOCK_SCHEMA)  # 29
-PAIR_FEAT_DIM = len(PAIR_SCHEMA)    # 34
+PAIR_FEAT_DIM = len(PAIR_SCHEMA)    # 41
 
 
 # =============================================================================
@@ -454,7 +481,8 @@ def extract_pair_feats(
     u: Dict[str, Any],
     v: Dict[str, Any],
     page: Dict[str, Any],
-    column_count: float = None
+    column_count: float = None,
+    median_gap: float = None,
 ) -> List[float]:
     """
     提取 block pair (u, v) 的特征向量，与 eval.py 完全对齐
@@ -464,6 +492,7 @@ def extract_pair_feats(
         v: 目标 block
         page: page 字典
         column_count: 总栏数（可选）
+        median_gap: 页面中位数垂直间距（可选，用于 vertical_gap_to_median_ratio）
     
     Returns:
         特征向量（长度 = PAIR_FEAT_DIM）
@@ -569,7 +598,26 @@ def extract_pair_feats(
         v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
-    
+
+    # ===== PR4 新增特征（7个）=====
+    _median_gap = float(median_gap) if median_gap is not None else get_meta_field(u, "_median_gap", page_h * 0.01)
+    _median_gap = max(1.0, _median_gap)
+    vertical_gap_to_median_ratio = gap_y / _median_gap
+
+    horizontal_gap_norm = abs(vc_x - uc_x) / page_w
+
+    column_distance = abs(v_col_id - u_col_id)
+
+    indent_diff_norm = (vx1 - ux1) / page_w
+
+    width_ratio = vw / (uw + 1.0)
+
+    u_is_cross_column = 1.0 if (uw > 0.7 * page_w) else 0.0
+
+    u_hf = u_type in ("header", "footer")
+    v_hf = v_type in ("header", "footer")
+    header_footer_penalty = 1.0 if (u_hf or v_hf) else 0.0
+
     # 构建特征向量（顺序必须与 PAIR_SCHEMA 一致）
     feats = [
         # 相对位置（3个）
@@ -613,6 +661,15 @@ def extract_pair_feats(
         v_col_id,
         float(_column_count),
         text_line_count_ratio,
+
+        # PR4 新增特征（7个）
+        vertical_gap_to_median_ratio,
+        horizontal_gap_norm,
+        column_distance,
+        indent_diff_norm,
+        width_ratio,
+        u_is_cross_column,
+        header_footer_penalty,
     ]
     
     assert len(feats) == PAIR_FEAT_DIM, f"Pair 特征维度错误: {len(feats)} != {PAIR_FEAT_DIM}"
@@ -681,16 +738,24 @@ def compute_height_percentiles(blocks: List[Dict]) -> Dict[Any, float]:
 
 def detect_columns(blocks: List[Dict], page: Dict) -> Dict[Any, int]:
     """
-    检测页面栏布局，为每个 block 分配 column_id
+    检测页面栏布局，为每个 block 分配 column_id。
 
-    基于 x 坐标聚类，返回 {block_id: column_id}
+    优先使用基于投影直方图的稳健栏分割（来自 utils.reading_order），
+    回退到简单间距分割。
+
+    返回 {block_id: column_id}
     """
     if not blocks:
         return {}
 
     page_w = max(1, page.get("width", 1))
 
-    # 提取每个 block 的中心 x 坐标
+    if _HAS_READING_ORDER_UTILS:
+        boundaries = detect_columns_by_projection(blocks, page_w)
+        column_map, _ = assign_block_columns(blocks, boundaries)
+        return column_map
+
+    # 回退：简单间距分割
     centers = []
     for b in blocks:
         bbox = b.get("bbox")
@@ -701,31 +766,22 @@ def detect_columns(blocks: List[Dict], page: Dict) -> Dict[Any, int]:
     if not centers:
         return {}
 
-    # 按 x 排序
     centers.sort(key=lambda x: x[1])
     xs = [c[1] for c in centers]
 
-    # 计算间距
-    gaps = []
-    for i in range(len(xs) - 1):
-        gaps.append((xs[i + 1] - xs[i], i))
-
+    gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
     if not gaps:
         return {bid: 0 for bid, _ in centers}
 
-    # 找最大间距
     max_gap, max_idx = max(gaps, key=lambda x: x[0])
     median_gap = np.median([g[0] for g in gaps]) if gaps else max_gap
 
-    # 判断是否多栏
     column_map = {}
     if max_gap > 1.5 * median_gap and max_gap > 0.15 * page_w:
-        # 多栏：按最大间距分割
         threshold = (xs[max_idx] + xs[max_idx + 1]) / 2
         for bid, cx in centers:
             column_map[bid] = 0 if cx <= threshold else 1
     else:
-        # 单栏
         for bid, _ in centers:
             column_map[bid] = 0
 
@@ -737,7 +793,7 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
     为 blocks 添加栏信息到 meta 字段（原地修改）
 
     添加：column_id, column_count, is_first_in_column, is_last_in_column
-    同时添加文本行数估计
+    同时添加文本行数估计和中位数垂直间距
     """
     if not blocks:
         return
@@ -745,6 +801,12 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
     column_map = detect_columns(blocks, page)
     column_count = len(set(column_map.values())) if column_map else 1
     page_h = max(1, page.get("height", 1))
+
+    # 计算页面中位数垂直间距（用于 PR4 新特征）
+    if _HAS_READING_ORDER_UTILS:
+        median_gap = compute_page_median_gap(blocks, page_h)
+    else:
+        median_gap = page_h * 0.01
 
     # 按栏分组，并在栏内按 y 排序
     columns: Dict[int, List[Dict]] = defaultdict(list)
@@ -765,6 +827,7 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
             b["meta"]["column_count"] = float(column_count)
             b["meta"]["is_first_in_column"] = 1.0 if i == 0 else 0.0
             b["meta"]["is_last_in_column"] = 1.0 if i == len(col_blocks) - 1 else 0.0
+            b["meta"]["_median_gap"] = float(median_gap)
             
             # 估计文本行数（如果尚未设置）
             if "text_line_count" not in b["meta"] and "block_text_line_count" not in b["meta"]:
