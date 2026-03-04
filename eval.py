@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import math
 import html
@@ -1076,6 +1077,105 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
 
 
 # -----------------------------------------------------------------------------
+# PPStructure layout detection fallback
+# -----------------------------------------------------------------------------
+_PADDLE_LAYOUT_ENGINE = None
+
+def _init_paddle_layout():
+    """
+    延迟初始化 PPStructure 布局检测引擎（单例）。
+    
+    返回 PPStructure 实例，如果不可用则返回 None。
+    """
+    global _PADDLE_LAYOUT_ENGINE
+    if _PADDLE_LAYOUT_ENGINE is not None:
+        return _PADDLE_LAYOUT_ENGINE
+    try:
+        from paddleocr import PPStructure
+        _PADDLE_LAYOUT_ENGINE = PPStructure(
+            table=False,
+            ocr=False,
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    try:
+        from paddleocr import PaddleOCR
+        # 部分版本 PaddleOCR 支持 layout 参数
+        _PADDLE_LAYOUT_ENGINE = PaddleOCR(
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    return None
+
+
+_PADDLE_LAYOUT_LABEL_MAP = {
+    "title": "title",
+    "text": "paragraph",
+    "figure": "figure",
+    "figure_caption": "caption",
+    "table": "table",
+    "table_caption": "caption",
+    "header": "header",
+    "footer": "footer",
+    "reference": "paragraph",
+    "equation": "formula",
+    "abstract": "paragraph",
+    "list": "list_item",
+    "paragraph": "paragraph",
+    "image": "figure",
+    "chart": "chart",
+    "formula": "formula",
+    "caption": "caption",
+    "list_item": "list_item",
+    "unknown": "unknown",
+}
+
+
+def _run_paddle_layout(img_path: str, debug: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    使用 PPStructure 做布局检测，返回 {"bbox", "label", "score"} 列表。
+    """
+    t0 = _now_ms()
+    engine = _init_paddle_layout()
+    if engine is None:
+        debug["paddle_layout_status"] = "unavailable"
+        debug["paddle_layout_ms"] = 0.0
+        return []
+    try:
+        result = engine(img_path)
+        dets: List[Dict[str, Any]] = []
+        if result:
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                bbox_raw = item.get("bbox") or item.get("region")
+                if not bbox_raw:
+                    continue
+                if len(bbox_raw) == 4:
+                    x1, y1, x2, y2 = bbox_raw
+                else:
+                    continue
+                raw_label = (item.get("type") or item.get("label") or "unknown").lower()
+                label = _PADDLE_LAYOUT_LABEL_MAP.get(raw_label, "unknown")
+                score = float(item.get("score", 1.0) or 1.0)
+                dets.append({"bbox": [int(x1), int(y1), int(x2), int(y2)], "label": label, "score": score})
+        debug["paddle_layout_status"] = "ok"
+        debug["paddle_layout_detections"] = len(dets)
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return dets
+    except Exception as e:
+        debug["paddle_layout_status"] = f"error:{str(e)[:120]}"
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return []
+
+
+# -----------------------------------------------------------------------------
 # OCR (full-image + ROI)
 # -----------------------------------------------------------------------------
 def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1434,6 +1534,10 @@ def build_ir_candidates(sample: Dict[str, Any], cfg: Dict[str, Any], models: Mod
     layout_dets: List[Dict[str, Any]] = []
     if layout_enabled and models.layout_detector is not None:
         layout_dets = _run_layout_detector(img_path, cfg, models, debug)
+
+    # PPStructure fallback: when no ONNX layout model, try PPStructure
+    if not layout_dets and models.layout_detector is None:
+        layout_dets = _run_paddle_layout(img_path, debug)
 
     if layout_dets:
         blocks: List[Dict[str, Any]] = []
@@ -2043,13 +2147,95 @@ def _extract_tables(blocks: List[Dict[str, Any]], ocr_lines: List[Dict[str, Any]
 # -----------------------------------------------------------------------------
 # Formula handling (placeholder for future latex OCR)
 # -----------------------------------------------------------------------------
-def _process_formula_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _process_formula_blocks(blocks: List[Dict[str, Any]], img_path: str = "",
+                            page: Optional[Dict[str, Any]] = None,
+                            cfg: Optional[Dict[str, Any]] = None,
+                            models: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """
+    为公式块填充 LaTeX 内容。
+    
+    优先级:
+    1. 块已有 latex 字段 -> 直接使用
+    2. 尝试 rapid_latex_ocr / pix2tex 专用公式 OCR
+    3. 使用 PaddleOCR 对公式区域进行普通 OCR，用 $...$ 包裹
+    4. 降级为空字符串
+    """
+    formula_blocks = [b for b in blocks if b.get("type") == "formula"
+                      and not (b.get("latex") or b.get("text"))]
+    if not formula_blocks:
+        return blocks
+
+    # 尝试专用公式 OCR 引擎
+    _rapid_latex_ocr = None
+    try:
+        from rapid_latex_ocr import LatexOCR
+        _rapid_latex_ocr = LatexOCR()
+    except Exception:
+        pass
+
+    if _rapid_latex_ocr is None:
+        try:
+            from pix2tex.cli import LatexOCR as Pix2TexOCR
+            _rapid_latex_ocr = Pix2TexOCR()
+        except Exception:
+            pass
+
+    for b in formula_blocks:
+        latex = ""
+        bbox = b.get("bbox", [])
+        # 尝试专用公式 OCR
+        if _rapid_latex_ocr is not None and img_path and bbox and len(bbox) >= 4:
+            try:
+                img = Image.open(img_path).convert("RGB")
+                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                crop = img.crop((x1, y1, x2, y2))
+                result = _rapid_latex_ocr(crop)
+                if isinstance(result, tuple) and result:
+                    latex = str(result[0] or "")
+                elif result is not None:
+                    latex = str(result)
+            except Exception:
+                pass
+
+        # 如果专用 OCR 无结果，使用 PaddleOCR 普通 OCR 并用 $...$ 包裹
+        if not latex and img_path and bbox and len(bbox) >= 4:
+            try:
+                paddle_engine = _init_paddle_ocr()
+                if paddle_engine is not None:
+                    img = Image.open(img_path).convert("RGB")
+                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    crop = img.crop((x1, y1, x2, y2))
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp_path = tmp.name
+                        crop.save(tmp_path)
+                    try:
+                        ocr_result = paddle_engine.ocr(tmp_path, cls=False)
+                        texts = []
+                        if ocr_result:
+                            for line in ocr_result:
+                                if line:
+                                    for item in line:
+                                        if item and len(item) >= 2 and item[1]:
+                                            texts.append(item[1][0])
+                        if texts:
+                            latex = "$" + " ".join(texts) + "$"
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if latex:
+            b["latex"] = latex
+
+    # Ensure all formula blocks have at least empty string
     for b in blocks:
         if b.get("type") == "formula":
-            if "latex" not in b or b.get("latex") is None:
+            if not b.get("latex") and not b.get("text"):
                 b["latex"] = ""
     return blocks
-
 
 # -----------------------------------------------------------------------------
 # Heading parent building (required; decode() depends on it)
@@ -2435,59 +2621,38 @@ def _bbox_attr(bbox: List[float]) -> str:
 
 def _render_table_cell(cell: Dict[str, Any]) -> str:
     """渲染单个表格单元格"""
-    bbox_str = _bbox_attr(cell.get("bbox", []))
     rowspan = int(cell.get("rowspan", 1) or 1)
     colspan = int(cell.get("colspan", 1) or 1)
     text = _escape(cell.get("text", "") or "")
     
-    attrs = [f'data-bbox="{bbox_str}"']
+    attrs = []
     if rowspan > 1:
         attrs.append(f'rowspan="{rowspan}"')
     if colspan > 1:
         attrs.append(f'colspan="{colspan}"')
     
-    return f'<td {" ".join(attrs)}>{text}</td>'
+    if attrs:
+        return f'<td {" ".join(attrs)}>{text}</td>'
+    return f'<td>{text}</td>'
 
 
 def _render_table_content(table_obj: Dict[str, Any]) -> str:
     """
-    渲染表格内部结构 (thead + tbody)
-    
-    评测要求: <table><thead>...</thead><tbody>...</tbody></table>
+    渲染表格内部结构
+
+    评测要求: <table><tr><td>文本</td></tr></table>（不要 thead/tbody）
     """
     rows = table_obj.get("rows", [])
     
     if not rows:
-        # 空表格: 至少输出一个空行
-        return "<table><thead><tr><td></td></tr></thead><tbody></tbody></table>"
-    
-    # 分离表头和表体
-    # 策略: 第一行作为表头，其余作为表体
-    thead_rows = rows[:1] if rows else []
-    tbody_rows = rows[1:] if len(rows) > 1 else []
+        return "<table><tr><td></td></tr></table>"
     
     parts = ["<table>"]
-    
-    # 渲染 thead
-    parts.append("<thead>")
-    for row in thead_rows:
+    for row in rows:
         parts.append("<tr>")
         for cell in row:
             parts.append(_render_table_cell(cell))
         parts.append("</tr>")
-    if not thead_rows:
-        parts.append("<tr><td></td></tr>")
-    parts.append("</thead>")
-    
-    # 渲染 tbody
-    parts.append("<tbody>")
-    for row in tbody_rows:
-        parts.append("<tr>")
-        for cell in row:
-            parts.append(_render_table_cell(cell))
-        parts.append("</tr>")
-    parts.append("</tbody>")
-    
     parts.append("</table>")
     return "".join(parts)
 
@@ -2549,15 +2714,8 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     
     # 公式
     if btype == "formula":
-        latex = b.get("latex") or ""
-        latex = latex.strip()
-        if latex:
-            # 有 LaTeX 内容时添加 data-latex 属性
-            latex_escaped = _escape(latex)
-            return f'<div class="formula" data-bbox="{bbox_str}" data-latex="{latex_escaped}"></div>'
-        else:
-            # 无法识别 LaTeX 时忽略该属性
-            return f'<div class="formula" data-bbox="{bbox_str}"></div>'
+        latex_text = b.get("latex") or b.get("text") or ""
+        return f'<div class="formula" data-bbox="{bbox_str}">{latex_text}</div>'
     
     # 页眉
     if btype == "header":
@@ -2780,7 +2938,7 @@ def process_one(sample: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle
 
     # 6) Formula blocks
     try:
-        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path, page, cfg, models)
     except Exception as e:
         debug["formula_error"] = str(e)[:200]
 
@@ -2918,7 +3076,7 @@ def _run_fallback(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle, 
 
     # 3) tables + formulas
     ir["tables"] = _extract_tables(ir.get("blocks", []), ocr_lines, img_path, ir.get("page", {}), cfg, models, debug)
-    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []), img_path, ir.get("page", {}), cfg, models)
 
     debug["fallback_ms"] = round(_now_ms() - t0, 2)
     return ir, ocr_lines

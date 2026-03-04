@@ -577,6 +577,8 @@ def extract_blocks_and_tables(body) -> Tuple[List[Dict[str, Any]], List[Dict[str
             bid += 1
         elif btype == "formula":
             latex = el.get("data-latex", "") or ""
+            if not latex:
+                latex = text  # fall back to text content (annotation format)
             blocks.append({
                 "id": bid, "bbox": bbox, "type": btype,
                 "score": 1.0, "text": text, "style": None,
@@ -1648,7 +1650,7 @@ def renderer(ir: Dict[str, Any]) -> str:
     if order is None:
         order = [b["id"] for b in blocks]
 
-    # 生成 HTML
+    # 生成 HTML（严格符合评测标注格式）
     html_parts = ["<body>"]
     for bid in order:
         b = id2b.get(bid)
@@ -1665,36 +1667,44 @@ def renderer(ir: Dict[str, Any]) -> str:
         elif t == "paragraph":
             html_parts.append(f'<p data-bbox="{bb}">{txt}</p>')
         elif t == "list_item":
-            html_parts.append(f'<ul><li data-bbox="{bb}">{txt}</li></ul>')
+            html_parts.append(f'<div class="list_item" data-bbox="{bb}">{txt}</div>')
         elif t == "caption":
-            ref = ""
-            for lk in relations.get("caption_links", []):
-                if lk["caption_id"] == b["id"]:
-                    ref = f' data-ref="{lk["target_id"]}"'
-                    break
-            html_parts.append(f'<figcaption data-bbox="{bb}"{ref}>{txt}</figcaption>')
+            html_parts.append(f'<div class="caption" data-bbox="{bb}">{txt}</div>')
         elif t == "figure":
-            html_parts.append(f'<figure data-bbox="{bb}"></figure>')
+            html_parts.append(f'<div class="image" data-bbox="{bb}"></div>')
+        elif t == "chart":
+            html_parts.append(f'<div class="chart" data-bbox="{bb}"></div>')
         elif t == "table":
-            html_parts.append(f'<table data-bbox="{bb}">')
             tbl = next((tb for tb in ir.get("tables", []) if tb["id"] == b["id"]), None)
             rows = tbl.get("rows", []) if tbl else []
+            table_parts = ["<table>"]
             for row in rows:
-                html_parts.append("<tr>")
+                table_parts.append("<tr>")
                 for cell in row:
-                    cbb = bbox_str(cell["bbox"])
                     rs = cell.get("rowspan", 1)
                     cs = cell.get("colspan", 1)
                     ctext = html.escape(cell.get("text", "") or "")
-                    html_parts.append(f'<td data-bbox="{cbb}" rowspan="{rs}" colspan="{cs}">{ctext}</td>')
-                html_parts.append("</tr>")
-            html_parts.append("</table>")
+                    cell_attrs = []
+                    if rs and rs > 1:
+                        cell_attrs.append(f'rowspan="{rs}"')
+                    if cs and cs > 1:
+                        cell_attrs.append(f'colspan="{cs}"')
+                    if cell_attrs:
+                        table_parts.append(f'<td {" ".join(cell_attrs)}>{ctext}</td>')
+                    else:
+                        table_parts.append(f'<td>{ctext}</td>')
+                table_parts.append("</tr>")
+            table_parts.append("</table>")
+            html_parts.append(f'<div class="table" data-bbox="{bb}">{"".join(table_parts)}</div>')
         elif t == "formula":
-            latex = html.escape(b.get("latex", "") or "")
-            html_parts.append(f'<span class="formula" data-bbox="{bb}" data-latex="{latex}"></span>')
+            latex_text = b.get("latex") or b.get("text") or ""
+            html_parts.append(f'<div class="formula" data-bbox="{bb}">{latex_text}</div>')
+        elif t == "header":
+            html_parts.append(f'<div class="header" data-bbox="{bb}">{txt}</div>')
+        elif t == "footer":
+            html_parts.append(f'<div class="footer" data-bbox="{bb}">{txt}</div>')
         else:
-            tag = t if t != "unknown" else "p"
-            html_parts.append(f'<{tag} data-bbox="{bb}">{txt}</{tag}>')
+            html_parts.append(f'<p data-bbox="{bb}">{txt}</p>')
 
     html_parts.append("</body>")
     return "".join(html_parts)
