@@ -2,12 +2,14 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import math
 import html
 import hashlib
 import random
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -453,7 +455,20 @@ def _iou(box1: List[float], box2: List[float]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+CLASS_NMS_THRESHOLDS = {
+    "table": 0.3,
+    "figure": 0.3,
+    "image": 0.3,
+    "paragraph": 0.5,
+    "formula": 0.4,
+    "title": 0.4,
+    "header": 0.4,
+    "footer": 0.4,
+}
+DEFAULT_NMS_THRESHOLD = 0.45
+
+
+def _nms_single_class(detections: List[Dict[str, Any]], iou_threshold: float) -> List[Dict[str, Any]]:
     if not detections:
         return []
     dets = sorted(detections, key=lambda x: float(x.get("score", 0.0)), reverse=True)
@@ -463,6 +478,22 @@ def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) ->
         keep.append(best)
         dets = [d for d in dets if _iou(best["bbox"], d["bbox"]) < iou_threshold]
     return keep
+
+
+def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = None) -> List[Dict[str, Any]]:
+    if not detections:
+        return []
+    if iou_threshold is None:
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for det in detections:
+            groups[det.get("type", det.get("label", "unknown"))].append(det)
+        results = []
+        for cls, dets in groups.items():
+            threshold = CLASS_NMS_THRESHOLDS.get(cls, DEFAULT_NMS_THRESHOLD)
+            results.extend(_nms_single_class(dets, threshold))
+        return results
+    else:
+        return _nms_single_class(detections, iou_threshold)
 
 
 def _union_bbox(bboxes: List[List[float]]) -> List[float]:
@@ -556,7 +587,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -671,8 +702,8 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
     
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致
@@ -756,6 +787,33 @@ def _vectorize(feat_dict: Dict[str, float], schema: List[str], strict: bool = Fa
     if warn_missing and missing and len(missing) > len(schema) * 0.1:
         sys.stderr.write(f"[warn] {len(missing)}/{len(schema)} features missing in vectorization\n")
     return vec
+
+
+# -----------------------------------------------------------------------------
+# OCR post-processing
+# -----------------------------------------------------------------------------
+def postprocess_ocr_text(text: str, block_type: str = "paragraph") -> str:
+    """OCR 文本后处理"""
+    if not text:
+        return text
+
+    # 1. 去除多余空白
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = text.strip()
+
+    # 2. 中英文之间加空格
+    text = re.sub(r'([a-zA-Z0-9])([\u4e00-\u9fff])', r'\1 \2', text)
+    text = re.sub(r'([\u4e00-\u9fff])([a-zA-Z0-9])', r'\1 \2', text)
+
+    # 3. 修复常见 OCR 错误字符
+    text = text.replace('\u2014', '-')
+    text = text.replace('\u2026', '...')
+    text = text.replace('\u00a0', ' ')  # non-breaking space
+
+    # 4. 去除控制字符
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+    return text
 
 
 # -----------------------------------------------------------------------------
@@ -1047,6 +1105,105 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
 
 
 # -----------------------------------------------------------------------------
+# PPStructure layout detection fallback
+# -----------------------------------------------------------------------------
+_PADDLE_LAYOUT_ENGINE = None
+
+def _init_paddle_layout():
+    """
+    延迟初始化 PPStructure 布局检测引擎（单例）。
+    
+    返回 PPStructure 实例，如果不可用则返回 None。
+    """
+    global _PADDLE_LAYOUT_ENGINE
+    if _PADDLE_LAYOUT_ENGINE is not None:
+        return _PADDLE_LAYOUT_ENGINE
+    try:
+        from paddleocr import PPStructure
+        _PADDLE_LAYOUT_ENGINE = PPStructure(
+            table=False,
+            ocr=False,
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    try:
+        from paddleocr import PaddleOCR
+        # 部分版本 PaddleOCR 支持 layout 参数
+        _PADDLE_LAYOUT_ENGINE = PaddleOCR(
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    return None
+
+
+_PADDLE_LAYOUT_LABEL_MAP = {
+    "title": "title",
+    "text": "paragraph",
+    "figure": "figure",
+    "figure_caption": "caption",
+    "table": "table",
+    "table_caption": "caption",
+    "header": "header",
+    "footer": "footer",
+    "reference": "paragraph",
+    "equation": "formula",
+    "abstract": "paragraph",
+    "list": "list_item",
+    "paragraph": "paragraph",
+    "image": "figure",
+    "chart": "chart",
+    "formula": "formula",
+    "caption": "caption",
+    "list_item": "list_item",
+    "unknown": "unknown",
+}
+
+
+def _run_paddle_layout(img_path: str, debug: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    使用 PPStructure 做布局检测，返回 {"bbox", "label", "score"} 列表。
+    """
+    t0 = _now_ms()
+    engine = _init_paddle_layout()
+    if engine is None:
+        debug["paddle_layout_status"] = "unavailable"
+        debug["paddle_layout_ms"] = 0.0
+        return []
+    try:
+        result = engine(img_path)
+        dets: List[Dict[str, Any]] = []
+        if result:
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                bbox_raw = item.get("bbox") or item.get("region")
+                if not bbox_raw:
+                    continue
+                if len(bbox_raw) == 4:
+                    x1, y1, x2, y2 = bbox_raw
+                else:
+                    continue
+                raw_label = (item.get("type") or item.get("label") or "unknown").lower()
+                label = _PADDLE_LAYOUT_LABEL_MAP.get(raw_label, "unknown")
+                score = float(item.get("score", 1.0) or 1.0)
+                dets.append({"bbox": [int(x1), int(y1), int(x2), int(y2)], "label": label, "score": score})
+        debug["paddle_layout_status"] = "ok"
+        debug["paddle_layout_detections"] = len(dets)
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return dets
+    except Exception as e:
+        debug["paddle_layout_status"] = f"error:{str(e)[:120]}"
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return []
+
+
+# -----------------------------------------------------------------------------
 # OCR (full-image + ROI)
 # -----------------------------------------------------------------------------
 def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1116,7 +1273,7 @@ def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, deb
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -1216,7 +1373,7 @@ def _ocr_roi(img_path: str, roi_bbox: List[float], cfg: Dict[str, Any], models: 
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs) + x1), float(min(ys) + y1), float(max(xs) + x1), float(max(ys) + y1)]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -1405,6 +1562,10 @@ def build_ir_candidates(sample: Dict[str, Any], cfg: Dict[str, Any], models: Mod
     layout_dets: List[Dict[str, Any]] = []
     if layout_enabled and models.layout_detector is not None:
         layout_dets = _run_layout_detector(img_path, cfg, models, debug)
+
+    # PPStructure fallback: when no ONNX layout model, try PPStructure
+    if not layout_dets and models.layout_detector is None:
+        layout_dets = _run_paddle_layout(img_path, debug)
 
     if layout_dets:
         blocks: List[Dict[str, Any]] = []
@@ -2044,7 +2205,6 @@ def _process_formula_blocks(
         b["latex"] = normalize_latex(raw)
     return blocks
 
-
 # -----------------------------------------------------------------------------
 # Heading parent building (required; decode() depends on it)
 # -----------------------------------------------------------------------------
@@ -2429,59 +2589,38 @@ def _bbox_attr(bbox: List[float]) -> str:
 
 def _render_table_cell(cell: Dict[str, Any]) -> str:
     """渲染单个表格单元格"""
-    bbox_str = _bbox_attr(cell.get("bbox", []))
     rowspan = int(cell.get("rowspan", 1) or 1)
     colspan = int(cell.get("colspan", 1) or 1)
     text = _escape(cell.get("text", "") or "")
     
-    attrs = [f'data-bbox="{bbox_str}"']
+    attrs = []
     if rowspan > 1:
         attrs.append(f'rowspan="{rowspan}"')
     if colspan > 1:
         attrs.append(f'colspan="{colspan}"')
     
-    return f'<td {" ".join(attrs)}>{text}</td>'
+    if attrs:
+        return f'<td {" ".join(attrs)}>{text}</td>'
+    return f'<td>{text}</td>'
 
 
 def _render_table_content(table_obj: Dict[str, Any]) -> str:
     """
-    渲染表格内部结构 (thead + tbody)
-    
-    评测要求: <table><thead>...</thead><tbody>...</tbody></table>
+    渲染表格内部结构
+
+    评测要求: <table><tr><td>文本</td></tr></table>（不要 thead/tbody）
     """
     rows = table_obj.get("rows", [])
-    
+
     if not rows:
-        # 空表格: 至少输出一个空行
-        return "<table><thead><tr><td></td></tr></thead><tbody></tbody></table>"
-    
-    # 分离表头和表体
-    # 策略: 第一行作为表头，其余作为表体
-    thead_rows = rows[:1] if rows else []
-    tbody_rows = rows[1:] if len(rows) > 1 else []
-    
+        return "<table><tr><td></td></tr></table>"
+
     parts = ["<table>"]
-    
-    # 渲染 thead
-    parts.append("<thead>")
-    for row in thead_rows:
+    for row in rows:
         parts.append("<tr>")
         for cell in row:
             parts.append(_render_table_cell(cell))
         parts.append("</tr>")
-    if not thead_rows:
-        parts.append("<tr><td></td></tr>")
-    parts.append("</thead>")
-    
-    # 渲染 tbody
-    parts.append("<tbody>")
-    for row in tbody_rows:
-        parts.append("<tr>")
-        for cell in row:
-            parts.append(_render_table_cell(cell))
-        parts.append("</tr>")
-    parts.append("</tbody>")
-    
     parts.append("</table>")
     return "".join(parts)
 
@@ -2543,8 +2682,8 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     
     # 公式
     if btype == "formula":
-        latex = normalize_latex(b.get("latex") or "")
-        return f'<div class="formula" data-bbox="{bbox_str}">{latex}</div>'
+        latex_text = b.get("latex") or b.get("text") or ""
+        return f'<div class="formula" data-bbox="{bbox_str}">{latex_text}</div>'
     
     # 页眉
     if btype == "header":
@@ -3184,7 +3323,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -3283,8 +3422,8 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
     
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致
