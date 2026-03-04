@@ -35,6 +35,17 @@ models:
       type: "yolo"
       version: "yolov8n"
       score_threshold: 0.25
+      nms_mode: "class_aware"        # class_aware | agnostic
+      nms_threshold: 0.5             # used only when nms_mode=agnostic
+      hf_refine_enabled: false       # post-hoc header/footer heuristic
+      hf_top_ratio: 0.08
+      hf_bottom_ratio: 0.08
+      hf_width_ratio: 0.6
+      second_pass_enabled: false     # set true for accuracy-first mode
+      second_pass_input_size: 1280
+      second_pass_score_threshold: 0.2
+      second_pass_min_detections: 2
+      second_pass_avg_conf_threshold: 0.35
     ocr:
       enabled: true
       version: "PP-OCRv4"

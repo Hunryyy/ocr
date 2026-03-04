@@ -169,6 +169,20 @@ class ModelBundle:
     layout_input_size: int = 1024
     layout_nms_threshold: float = 0.5
     layout_score_threshold: float = 0.3
+    layout_nms_mode: str = "class_aware"  # "class_aware" | "agnostic"
+
+    # Header/footer post-hoc refinement
+    layout_hf_refine_enabled: bool = False
+    layout_hf_top_ratio: float = 0.08
+    layout_hf_bottom_ratio: float = 0.08
+    layout_hf_width_ratio: float = 0.6
+
+    # Second-pass strategy for difficult pages
+    layout_second_pass_enabled: bool = False
+    layout_second_pass_input_size: int = 1280
+    layout_second_pass_score_threshold: float = 0.2
+    layout_second_pass_min_detections: int = 2
+    layout_second_pass_avg_conf_threshold: float = 0.35
 
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
@@ -299,12 +313,24 @@ def _maybe_load_paddle(cfg: Dict[str, Any]):
         return None
 
 
-def _load_layout_class_map(cfg_map: Optional[Dict]) -> Dict[int, str]:
+def _load_layout_class_map(cfg_map) -> Dict[int, str]:
     """
-    Handle int->str, str->int, str->str (int keys as strings).
+    Handle:
+    - str path to a JSON file (e.g. "models/layout_class_map.json")
+    - dict with int->str, str->int, or str->str (int keys as strings) mappings
     """
     if not cfg_map:
         return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
+    # Support file-path string
+    if isinstance(cfg_map, str):
+        if os.path.exists(cfg_map):
+            try:
+                with open(cfg_map, "r", encoding="utf-8") as _f:
+                    cfg_map = json.load(_f)
+            except Exception:
+                return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
+        else:
+            return {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
     result: Dict[int, str] = {}
     for k, v in cfg_map.items():
         if isinstance(k, int) and isinstance(v, str):
@@ -379,6 +405,16 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
         bundle.layout_input_size = int(layout_cfg.get("input_size", 1024) or 1024)
         bundle.layout_nms_threshold = float(layout_cfg.get("nms_threshold", 0.5) or 0.5)
         bundle.layout_score_threshold = float(layout_cfg.get("score_threshold", 0.3) or 0.3)
+        bundle.layout_nms_mode = str(layout_cfg.get("nms_mode", "class_aware") or "class_aware")
+        bundle.layout_hf_refine_enabled = bool(layout_cfg.get("hf_refine_enabled", False))
+        bundle.layout_hf_top_ratio = float(layout_cfg.get("hf_top_ratio", 0.08) or 0.08)
+        bundle.layout_hf_bottom_ratio = float(layout_cfg.get("hf_bottom_ratio", 0.08) or 0.08)
+        bundle.layout_hf_width_ratio = float(layout_cfg.get("hf_width_ratio", 0.6) or 0.6)
+        bundle.layout_second_pass_enabled = bool(layout_cfg.get("second_pass_enabled", False))
+        bundle.layout_second_pass_input_size = int(layout_cfg.get("second_pass_input_size", 1280) or 1280)
+        bundle.layout_second_pass_score_threshold = float(layout_cfg.get("second_pass_score_threshold", 0.2) or 0.2)
+        bundle.layout_second_pass_min_detections = int(layout_cfg.get("second_pass_min_detections", 2) or 2)
+        bundle.layout_second_pass_avg_conf_threshold = float(layout_cfg.get("second_pass_avg_conf_threshold", 0.35) or 0.35)
     else:
         bundle.layout_class_map = {i: c for i, c in enumerate(DEFAULT_LAYOUT_CLASSES)}
 
@@ -1074,10 +1110,66 @@ def _map_to_original_coords(bbox_input_xyxy: List[float], scale: float, pad: Tup
     ]
 
 
+# Synonym map: raw label → canonical label
+_LABEL_SYNONYMS: Dict[str, str] = {
+    "text": "paragraph",
+    "equation": "formula",
+    "math": "formula",
+    "image": "figure",
+    "picture": "figure",
+    "figure_caption": "caption",
+    "table_caption": "caption",
+}
+
+
+def _normalize_layout_label(label: str) -> str:
+    """Map raw detector class name to canonical layout label."""
+    label = label.lower().strip()
+    label = _LABEL_SYNONYMS.get(label, label)
+    return label if label in SUPPORTED_BLOCK_TYPES else "unknown"
+
+
+def _refine_header_footer(
+    results: List[Dict[str, Any]],
+    orig_h: int,
+    orig_w: int,
+    top_ratio: float = 0.08,
+    bottom_ratio: float = 0.08,
+    width_ratio: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """
+    Post-hoc heuristic: relabel blocks that span wide and sit near the top or
+    bottom of the page as header/footer respectively.  Only text-like blocks
+    are candidates; non-text blocks (table/figure/chart/formula) are left alone.
+    """
+    if orig_h <= 0 or orig_w <= 0:
+        return results
+    top_threshold = orig_h * top_ratio
+    bottom_threshold = orig_h * (1.0 - bottom_ratio)
+    for det in results:
+        if det.get("label") in NON_TEXT_BLOCK_TYPES:
+            continue
+        x1, y1, x2, y2 = det["bbox"]
+        box_w = x2 - x1
+        if box_w / max(orig_w, 1) < width_ratio:
+            continue
+        if y2 <= top_threshold:
+            det["label"] = "header"
+        elif y1 >= bottom_threshold:
+            det["label"] = "footer"
+    return results
+
+
 def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle, debug: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Returns list of {"bbox":[x1,y1,x2,y2], "label":str, "score":float}
     Falls back to empty list (caller should use OCR fallback) when unavailable.
+
+    Supports:
+    - class-aware NMS by default (nms_mode="class_aware") to avoid suppressing
+      nearby different-class boxes (e.g. caption next to figure/table).
+    - optional header/footer post-hoc refinement (hf_refine_enabled=True).
+    - optional second-pass at higher resolution for difficult/sparse pages.
     """
     t0 = _now_ms()
     if models.layout_detector is None:
@@ -1099,49 +1191,77 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
         debug["layout_ms"] = round(_now_ms() - t0, 2)
         return []
 
+    def _run_single_pass(input_size: int, score_thr: float) -> Tuple[List[Dict[str, Any]], int, int]:
+        padded, scale, pad, orig_w, orig_h = _letterbox_resize(img, input_size)
+        if padded is None:
+            return [], 0, 0
+        tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+        sess = models.layout_detector
+        try:
+            input_name = sess.get_inputs()[0].name
+            outputs = sess.run(None, {input_name: tensor})
+            output_names = [o.name for o in sess.get_outputs()]
+        except Exception as e:
+            debug["layout_detector_status"] = f"inference_error:{str(e)[:120]}"
+            return [], orig_w, orig_h
+        num_classes = max(1, len(models.layout_class_map))
+        dets: List[Dict[str, Any]] = []
+        if len(outputs) == 1:
+            dets = _parse_yolo_output(outputs[0], num_classes, score_thr)
+        else:
+            dets = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs)), score_thr)
+        pass_results: List[Dict[str, Any]] = []
+        for det in dets:
+            bbox_in = _convert_to_xyxy(det, input_size)
+            bbox = _map_to_original_coords(bbox_in, scale, pad, orig_w, orig_h)
+            if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
+                continue
+            label = _normalize_layout_label(
+                models.layout_class_map.get(int(det["label_idx"]), "unknown")
+            )
+            pass_results.append({"bbox": bbox, "label": label, "score": float(det["score"])})
+        return pass_results, orig_w, orig_h
+
     input_size = int(models.layout_input_size or 1024)
-    padded, scale, pad, orig_w, orig_h = _letterbox_resize(img, input_size)
-    if padded is None:
-        debug["layout_detector_status"] = "preprocess_failed"
-        debug["layout_ms"] = round(_now_ms() - t0, 2)
-        return []
-
-    tensor = padded.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-
-    sess = models.layout_detector
-    try:
-        input_name = sess.get_inputs()[0].name
-        outputs = sess.run(None, {input_name: tensor})
-        output_names = [o.name for o in sess.get_outputs()]
-    except Exception as e:
-        debug["layout_detector_status"] = f"inference_error:{str(e)[:120]}"
-        debug["layout_ms"] = round(_now_ms() - t0, 2)
-        return []
-
-    num_classes = max(1, len(models.layout_class_map))
     score_thr = float(models.layout_score_threshold or 0.3)
 
-    dets: List[Dict[str, Any]] = []
-    if len(outputs) == 1:
-        dets = _parse_yolo_output(outputs[0], num_classes, score_thr)
+    results, orig_w, orig_h = _run_single_pass(input_size, score_thr)
+
+    # Second-pass: retry at higher resolution when page looks difficult
+    avg_conf_thr = float(models.layout_second_pass_avg_conf_threshold or 0.35)
+    if (
+        models.layout_second_pass_enabled
+        and (
+            len(results) < models.layout_second_pass_min_detections
+            or (results and (sum(r["score"] for r in results) / len(results)) < avg_conf_thr)
+        )
+    ):
+        sp_size = int(models.layout_second_pass_input_size or 1280)
+        sp_thr = float(models.layout_second_pass_score_threshold or 0.2)
+        second, sp_orig_w, sp_orig_h = _run_single_pass(sp_size, sp_thr)
+        if len(second) > len(results):
+            results, orig_w, orig_h = second, sp_orig_w, sp_orig_h
+            debug["layout_second_pass"] = True
+
+    # Apply class-aware or agnostic NMS
+    nms_mode = (models.layout_nms_mode or "class_aware").lower()
+    if nms_mode == "agnostic":
+        results = _nms_python(results, float(models.layout_nms_threshold or 0.5))
     else:
-        dets = _parse_fasterrcnn_outputs(dict(zip(output_names, outputs)), score_thr)
+        # class-aware: _nms_python(results) with no explicit threshold uses
+        # per-class thresholds from CLASS_NMS_THRESHOLDS
+        results = _nms_python(results)
 
-    results: List[Dict[str, Any]] = []
-    for det in dets:
-        bbox_in = _convert_to_xyxy(det, input_size)
-        bbox = _map_to_original_coords(bbox_in, scale, pad, orig_w, orig_h)
-        if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
-            continue
-        label = models.layout_class_map.get(int(det["label_idx"]), "unknown")
-        if label == "text":
-            label = "paragraph"
-        if label not in SUPPORTED_BLOCK_TYPES:
-            label = "unknown"
-        results.append({"bbox": bbox, "label": label, "score": float(det["score"])})
-
-    # NMS (class-agnostic)
-    results = _nms_python(results, float(models.layout_nms_threshold or 0.5))
+    # Optional header/footer post-hoc refinement
+    if models.layout_hf_refine_enabled and results:
+        results = _refine_header_footer(
+            results,
+            orig_h,
+            orig_w,
+            top_ratio=models.layout_hf_top_ratio,
+            bottom_ratio=models.layout_hf_bottom_ratio,
+            width_ratio=models.layout_hf_width_ratio,
+        )
 
     debug["layout_detector_status"] = "ok"
     debug["layout_detections"] = len(results)
