@@ -1,0 +1,14 @@
+# Core dependencies
+paddlepaddle-gpu
+paddleocr>=2.7.0
+lightgbm
+numpy
+scipy
+scikit-learn
+html5lib
+lxml
+Pillow
+
+# Optional: formula OCR (install if available)
+# rapid_latex_ocr
+# pix2tex

@@ -2,12 +2,14 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import math
 import html
 import hashlib
 import random
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +48,26 @@ try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None
+
+try:
+    import os as _os
+    import sys as _sys
+    _utils_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _utils_dir not in _sys.path:
+        _sys.path.insert(0, _utils_dir)
+    from utils.reading_order import (
+        detect_columns_by_projection as _detect_cols_proj,
+        assign_block_columns as _assign_block_cols,
+        compute_page_median_gap as _compute_median_gap,
+        sort_blocks_reading_order as _sort_blocks_reading_order,
+    )
+    _HAS_READING_ORDER_UTILS = True
+except Exception:  # pragma: no cover
+    _HAS_READING_ORDER_UTILS = False
+    _detect_cols_proj = None  # type: ignore
+    _assign_block_cols = None  # type: ignore
+    _compute_median_gap = None  # type: ignore
+    _sort_blocks_reading_order = None  # type: ignore
 
 
 # -----------------------------------------------------------------------------
@@ -151,6 +173,9 @@ class ModelBundle:
     # Store cfg and warnings
     cfg: Dict[str, Any] = field(default_factory=dict)
     model_disabled_reason: List[str] = field(default_factory=list)
+
+    # Formula recognizer
+    formula_recognizer: Any = None
 
 
 # -----------------------------------------------------------------------------
@@ -339,6 +364,13 @@ def load_artifacts(cfg: Dict[str, Any]) -> ModelBundle:
     # ---- OCR ----
     bundle.ocr_engine = _maybe_load_paddle(cfg)
 
+    # ---- formula recognizer ----
+    if _FORMULA_MODULE_OK:
+        try:
+            bundle.formula_recognizer = FormulaRecognizer(paddle_ocr=bundle.ocr_engine)
+        except Exception:
+            bundle.formula_recognizer = None
+
     # ---- layout detector ----
     layout_cfg = (fallback_cfg.get("layout_detector") or models_cfg.get("layout_detector") or {}) or {}
     if layout_cfg:
@@ -425,7 +457,20 @@ def _iou(box1: List[float], box2: List[float]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) -> List[Dict[str, Any]]:
+CLASS_NMS_THRESHOLDS = {
+    "table": 0.3,
+    "figure": 0.3,
+    "image": 0.3,
+    "paragraph": 0.5,
+    "formula": 0.4,
+    "title": 0.4,
+    "header": 0.4,
+    "footer": 0.4,
+}
+DEFAULT_NMS_THRESHOLD = 0.45
+
+
+def _nms_single_class(detections: List[Dict[str, Any]], iou_threshold: float) -> List[Dict[str, Any]]:
     if not detections:
         return []
     dets = sorted(detections, key=lambda x: float(x.get("score", 0.0)), reverse=True)
@@ -435,6 +480,22 @@ def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = 0.5) ->
         keep.append(best)
         dets = [d for d in dets if _iou(best["bbox"], d["bbox"]) < iou_threshold]
     return keep
+
+
+def _nms_python(detections: List[Dict[str, Any]], iou_threshold: float = None) -> List[Dict[str, Any]]:
+    if not detections:
+        return []
+    if iou_threshold is None:
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for det in detections:
+            groups[det.get("type", det.get("label", "unknown"))].append(det)
+        results = []
+        for cls, dets in groups.items():
+            threshold = CLASS_NMS_THRESHOLDS.get(cls, DEFAULT_NMS_THRESHOLD)
+            results.extend(_nms_single_class(dets, threshold))
+        return results
+    else:
+        return _nms_single_class(detections, iou_threshold)
 
 
 def _union_bbox(bboxes: List[List[float]]) -> List[float]:
@@ -551,7 +612,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -626,9 +687,10 @@ def _coarse_type_onehot(b: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, Any],
-                       column_count: float = 1.0) -> Dict[str, float]:
+                       column_count: float = 1.0,
+                       median_gap: float = None) -> Dict[str, float]:
     """
-    提取 pair 特征，与 train.py 的 PAIR_SCHEMA (34维) 完全对齐
+    提取 pair 特征，与 train.py 的 PAIR_SCHEMA (41维) 完全对齐
     """
     bb1 = b1.get("bbox", [0, 0, 0, 0])
     bb2 = b2.get("bbox", [0, 0, 0, 0])
@@ -656,35 +718,35 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     left_to_right = 1.0 if (same_row > 0.5 and x11 < x21) else 0.0
     is_above = 1.0 if y12 <= y21 else 0.0
     v_gap = max(0.0, y21 - y12)
-    
-    # 获取 column_id（从 block 的 meta 或默认 0）
+
+    # 获取 column_id（从 block 的顶层属性，由 _enrich_blocks_with_column_info 设置）
     u_col_id = float(b1.get("_column_id", 0))
     v_col_id = float(b2.get("_column_id", 0))
     same_column_id = 1.0 if u_col_id == v_col_id else 0.0
     column_diff = max(-3.0, min(3.0, v_col_id - u_col_id))
-    
+
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
-    
+
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致
     feats = {
         # 相对位置（3个）
         "dx_norm": dx / w,
         "dy_norm": dy / h,
         "center_dist_norm": dist / math.hypot(w, h),
-        
+
         # 重叠（2个）
         "x_overlap": x_overlap_ratio,
         "y_overlap": y_overlap_ratio,
-        
+
         # 尺寸比例（2个）
         "size_ratio_w": size_ratio_w,
         "size_ratio_h": size_ratio_h,
-        
+
         # 布局关系（6个）
         "same_column": same_col,
         "is_above": is_above,
@@ -692,17 +754,17 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "align_diff_right_norm": align_diff_right_norm,
         "same_row": same_row,
         "left_to_right": left_to_right,
-        
+
         # 间距（1个）
         "gap_y_norm": v_gap / h,
-        
+
         # 类型特征（4个）
         "u_is_title": 1.0 if b1.get("type") == "title" else 0.0,
         "v_is_title": 1.0 if b2.get("type") == "title" else 0.0,
         "u_heading_level": float(b1.get("style", {}).get("heading_level", 0) if b1.get("style") else 0.0),
         "v_heading_level": float(b2.get("style", {}).get("heading_level", 0) if b2.get("style") else 0.0),
     }
-    
+
     # 类型 one-hot（10个）
     u_one = _coarse_type_onehot(b1)
     v_one = _coarse_type_onehot(b2)
@@ -718,7 +780,7 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "v_caption": v_one["caption"],
         "v_other": v_one["other"],
     })
-    
+
     # ===== 新增特征（6个）与 train.py 对齐 =====
     feats.update({
         "same_column_id": same_column_id,
@@ -728,7 +790,22 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "column_count": column_count,
         "text_line_count_ratio": text_line_count_ratio,
     })
-    
+
+    # ===== PR4 新增特征（7个）与 train.py 对齐 =====
+    _median_gap = float(median_gap) if median_gap is not None else float(b1.get("_median_gap", h * 0.01))
+    _median_gap = max(1.0, _median_gap)
+    u_type = b1.get("type", "")
+    v_type = b2.get("type", "")
+    feats.update({
+        "vertical_gap_to_median_ratio": v_gap / _median_gap,
+        "horizontal_gap_norm": abs(cx2 - cx1) / w,
+        "column_distance": abs(v_col_id - u_col_id),
+        "indent_diff_norm": (x21 - x11) / w,
+        "width_ratio": bw2 / (bw1 + 1.0),
+        "u_is_cross_column": 1.0 if bw1 > 0.7 * w else 0.0,
+        "header_footer_penalty": 1.0 if (u_type in ("header", "footer") or v_type in ("header", "footer")) else 0.0,
+    })
+
     return feats
 
 
@@ -751,6 +828,33 @@ def _vectorize(feat_dict: Dict[str, float], schema: List[str], strict: bool = Fa
     if warn_missing and missing and len(missing) > len(schema) * 0.1:
         sys.stderr.write(f"[warn] {len(missing)}/{len(schema)} features missing in vectorization\n")
     return vec
+
+
+# -----------------------------------------------------------------------------
+# OCR post-processing
+# -----------------------------------------------------------------------------
+def postprocess_ocr_text(text: str, block_type: str = "paragraph") -> str:
+    """OCR 文本后处理"""
+    if not text:
+        return text
+
+    # 1. 去除多余空白
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = text.strip()
+
+    # 2. 中英文之间加空格
+    text = re.sub(r'([a-zA-Z0-9])([\u4e00-\u9fff])', r'\1 \2', text)
+    text = re.sub(r'([\u4e00-\u9fff])([a-zA-Z0-9])', r'\1 \2', text)
+
+    # 3. 修复常见 OCR 错误字符
+    text = text.replace('\u2014', '-')
+    text = text.replace('\u2026', '...')
+    text = text.replace('\u00a0', ' ')  # non-breaking space
+
+    # 4. 去除控制字符
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+    return text
 
 
 # -----------------------------------------------------------------------------
@@ -1046,6 +1150,105 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
 
 
 # -----------------------------------------------------------------------------
+# PPStructure layout detection fallback
+# -----------------------------------------------------------------------------
+_PADDLE_LAYOUT_ENGINE = None
+
+def _init_paddle_layout():
+    """
+    延迟初始化 PPStructure 布局检测引擎（单例）。
+    
+    返回 PPStructure 实例，如果不可用则返回 None。
+    """
+    global _PADDLE_LAYOUT_ENGINE
+    if _PADDLE_LAYOUT_ENGINE is not None:
+        return _PADDLE_LAYOUT_ENGINE
+    try:
+        from paddleocr import PPStructure
+        _PADDLE_LAYOUT_ENGINE = PPStructure(
+            table=False,
+            ocr=False,
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    try:
+        from paddleocr import PaddleOCR
+        # 部分版本 PaddleOCR 支持 layout 参数
+        _PADDLE_LAYOUT_ENGINE = PaddleOCR(
+            show_log=False,
+            layout=True,
+        )
+        return _PADDLE_LAYOUT_ENGINE
+    except Exception:
+        pass
+    return None
+
+
+_PADDLE_LAYOUT_LABEL_MAP = {
+    "title": "title",
+    "text": "paragraph",
+    "figure": "figure",
+    "figure_caption": "caption",
+    "table": "table",
+    "table_caption": "caption",
+    "header": "header",
+    "footer": "footer",
+    "reference": "paragraph",
+    "equation": "formula",
+    "abstract": "paragraph",
+    "list": "list_item",
+    "paragraph": "paragraph",
+    "image": "figure",
+    "chart": "chart",
+    "formula": "formula",
+    "caption": "caption",
+    "list_item": "list_item",
+    "unknown": "unknown",
+}
+
+
+def _run_paddle_layout(img_path: str, debug: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    使用 PPStructure 做布局检测，返回 {"bbox", "label", "score"} 列表。
+    """
+    t0 = _now_ms()
+    engine = _init_paddle_layout()
+    if engine is None:
+        debug["paddle_layout_status"] = "unavailable"
+        debug["paddle_layout_ms"] = 0.0
+        return []
+    try:
+        result = engine(img_path)
+        dets: List[Dict[str, Any]] = []
+        if result:
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                bbox_raw = item.get("bbox") or item.get("region")
+                if not bbox_raw:
+                    continue
+                if len(bbox_raw) == 4:
+                    x1, y1, x2, y2 = bbox_raw
+                else:
+                    continue
+                raw_label = (item.get("type") or item.get("label") or "unknown").lower()
+                label = _PADDLE_LAYOUT_LABEL_MAP.get(raw_label, "unknown")
+                score = float(item.get("score", 1.0) or 1.0)
+                dets.append({"bbox": [int(x1), int(y1), int(x2), int(y2)], "label": label, "score": score})
+        debug["paddle_layout_status"] = "ok"
+        debug["paddle_layout_detections"] = len(dets)
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return dets
+    except Exception as e:
+        debug["paddle_layout_status"] = f"error:{str(e)[:120]}"
+        debug["paddle_layout_ms"] = round(_now_ms() - t0, 2)
+        return []
+
+
+# -----------------------------------------------------------------------------
 # OCR (full-image + ROI)
 # -----------------------------------------------------------------------------
 def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, debug: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1115,7 +1318,7 @@ def _ocr_full_image(img_path: str, cfg: Dict[str, Any], models: ModelBundle, deb
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -1215,7 +1418,7 @@ def _ocr_roi(img_path: str, roi_bbox: List[float], cfg: Dict[str, Any], models: 
                 xs = [p[0] for p in quad]
                 ys = [p[1] for p in quad]
                 bbox = [float(min(xs) + x1), float(min(ys) + y1), float(max(xs) + x1), float(max(ys) + y1)]
-                lines.append({"bbox": bbox, "text": text})
+                lines.append({"bbox": bbox, "text": postprocess_ocr_text(text)})
 
     if cache_path:
         _save_ocr_cache(cache_path, lines)
@@ -1538,6 +1741,10 @@ def build_ir_candidates(sample: Dict[str, Any], cfg: Dict[str, Any], models: Mod
     layout_dets: List[Dict[str, Any]] = []
     if layout_enabled and models.layout_detector is not None:
         layout_dets = _run_layout_detector(img_path, cfg, models, debug)
+
+    # PPStructure fallback: when no ONNX layout model, try PPStructure
+    if not layout_dets and models.layout_detector is None:
+        layout_dets = _run_paddle_layout(img_path, debug)
 
     if layout_dets:
         blocks: List[Dict[str, Any]] = []
@@ -2146,15 +2353,37 @@ def _extract_tables(blocks: List[Dict[str, Any]], ocr_lines: List[Dict[str, Any]
 
 
 # -----------------------------------------------------------------------------
-# Formula handling (placeholder for future latex OCR)
+# Formula handling
 # -----------------------------------------------------------------------------
-def _process_formula_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _process_formula_blocks(
+    blocks: List[Dict[str, Any]],
+    img_path: Optional[str] = None,
+    recognizer: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    处理所有 formula 类型 block：
+    - 若 latex 未设置，尝试用 FormulaRecognizer 识别（需要 img_path）
+    - 规范化 latex 字符串
+    - 保证 latex 字段存在（识别失败时为空字符串，保留结构）
+    """
     for b in blocks:
-        if b.get("type") == "formula":
-            if "latex" not in b or b.get("latex") is None:
-                b["latex"] = ""
+        if b.get("type") != "formula":
+            continue
+        raw = b.get("latex") or ""
+        # 若没有 latex 且有图片路径与识别器，尝试识别
+        if raw == "" and img_path and recognizer is not None and Image is not None:
+            try:
+                page_img = Image.open(img_path).convert("RGB")
+                bbox = b.get("bbox", [])
+                if len(bbox) == 4:
+                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    roi = page_img.crop((x1, y1, x2, y2))
+                    raw = recognizer.recognize(roi)
+            except Exception:
+                raw = ""
+        # Normalize and store
+        b["latex"] = normalize_latex(raw)
     return blocks
-
 
 # -----------------------------------------------------------------------------
 # Heading parent building (required; decode() depends on it)
@@ -2327,11 +2556,24 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
     k_order = int(cfg.get("decode", {}).get("k_order", 8) or 8)
     cand_succ = _candidate_successors(blocks, page, k=k_order, max_blocks=max_blocks_cfg)
 
+    # 获取中位数间距（供 pair 特征使用）
+    _page_median_gap = float(page.get("_median_gap", 0))
+    if _page_median_gap <= 0:
+        page_h = max(1.0, float(page.get("height", 1)))
+        if _HAS_READING_ORDER_UTILS:
+            _page_median_gap = _compute_median_gap(blocks, page_h)
+        else:
+            _page_median_gap = page_h * 0.01
+        page["_median_gap"] = _page_median_gap
+
+    _col_count = float(page.get("_column_count", 1))
+
     feat_vecs: List[List[float]] = []
     pair_indices: List[Tuple[int, int]] = []
     for i, succs in cand_succ.items():
         for j in succs:
-            feats = _pair_feature_dict(blocks[i], blocks[j], page, column_count=float(page.get("_column_count", 1)))
+            feats = _pair_feature_dict(blocks[i], blocks[j], page, column_count=_col_count,
+                                       median_gap=_page_median_gap)
             feat_vecs.append(_vectorize(feats, models.feature_schema_pair, warn_missing=False))
             pair_indices.append((i, j))
 
@@ -2352,11 +2594,16 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
 
     if not use_model:
         for (i, j) in pair_indices:
-            feats = _pair_feature_dict(blocks[i], blocks[j], page, column_count=float(page.get("_column_count", 1)))
+            feats = _pair_feature_dict(blocks[i], blocks[j], page, column_count=_col_count,
+                                       median_gap=_page_median_gap)
             dist = float(feats.get("center_dist_norm", 0.5))
             base = 1.0 / (1.0 + dist * 2.0)
-            if feats.get("same_column", 0) > 0.5 and feats.get("is_above", 0) > 0.5:
+            # same_column_id is the accurate projection-based check (preferred);
+            # same_column is a geometric heuristic fallback (weaker boost).
+            if feats.get("same_column_id", 0) > 0.5 and feats.get("is_above", 0) > 0.5:
                 base *= 1.5
+            elif feats.get("same_column", 0) > 0.5 and feats.get("is_above", 0) > 0.5:
+                base *= 1.3
             if feats.get("same_row", 0) > 0.5 and feats.get("left_to_right", 0) > 0.5:
                 base *= 1.3
             scores.append(float(min(1.0, base)))
@@ -2425,7 +2672,7 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
 
         order_seq_idx = _build_sequence_from_chains(out_map, blocks)
 
-        # enforce header first, footer last
+        # enforce header first, footer last; body sorted by column order
         headers = [i for i in order_seq_idx if i in header_idx]
         footers = [i for i in order_seq_idx if i in footer_idx]
         body = [i for i in order_seq_idx if i not in header_idx and i not in footer_idx]
@@ -2436,6 +2683,49 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
 
         headers.sort(key=pos_key)
         footers.sort(key=pos_key)
+
+        # Column-aware body sort for multi-column pages
+        n_cols_order, col_idx_map = _detect_columns_for_order(blocks, page)
+        if n_cols_order > 1:
+            page_w = max(1.0, float(page.get("width", 1)))
+            cross_col_thresh = 0.7
+            cross_col_body: List[int] = []
+            regular_body: Dict[int, List[int]] = {}
+            for idx in body:
+                bb = blocks[idx].get("bbox", [0, 0, 0, 0])
+                bw = float(bb[2]) - float(bb[0])
+                col_id = col_idx_map.get(idx, 0)
+                if bw > cross_col_thresh * page_w:
+                    cross_col_body.append(idx)
+                else:
+                    regular_body.setdefault(col_id, []).append(idx)
+            cross_col_body.sort(key=pos_key)
+            for col_id in regular_body:
+                regular_body[col_id].sort(key=pos_key)
+            # Interleave cross-column blocks with column blocks by y position
+            body = []
+            col_lists: Dict[int, List[int]] = {c: list(regular_body.get(c, [])) for c in range(n_cols_order)}
+            col_ptrs: Dict[int, int] = {c: 0 for c in range(n_cols_order)}
+
+            def _flush_body_to_y(y_limit: float) -> None:
+                for c in range(n_cols_order):
+                    ptr = col_ptrs[c]
+                    col = col_lists[c]
+                    while ptr < len(col):
+                        bb = blocks[col[ptr]].get("bbox", [0, 0, 0, 0])
+                        if float(bb[1]) < y_limit:
+                            body.append(col[ptr])
+                            ptr += 1
+                        else:
+                            break
+                    col_ptrs[c] = ptr
+
+            for cross_idx in cross_col_body:
+                y1 = float(blocks[cross_idx].get("bbox", [0, 0, 0, 0])[1])
+                _flush_body_to_y(y1)
+                body.append(cross_idx)
+            _flush_body_to_y(float("inf"))
+
         order_seq_idx = headers + body + footers
 
     order_edges: List[Dict[str, Any]] = []
@@ -2445,7 +2735,13 @@ def predict_relations(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBund
 
     expected_edges = max(0, n - 1)
     if len(order_edges) != expected_edges:
-        sorted_idx = sorted(range(n), key=lambda i: (blocks[i]["bbox"][1], blocks[i]["bbox"][0]))
+        # Column-aware fallback sort
+        if _HAS_READING_ORDER_UTILS:
+            sorted_blocks = _sort_blocks_reading_order(blocks, page)
+            block_id_to_idx = {b["id"]: i for i, b in enumerate(blocks)}
+            sorted_idx = [block_id_to_idx[b["id"]] for b in sorted_blocks if b["id"] in block_id_to_idx]
+        else:
+            sorted_idx = sorted(range(n), key=lambda i: (blocks[i]["bbox"][1], blocks[i]["bbox"][0]))
         order_edges = [{"u": blocks[a]["id"], "v": blocks[b]["id"], "score": 1.0} for a, b in zip(sorted_idx[:-1], sorted_idx[1:])]
 
     captions = [b for b in blocks if b.get("type") == "caption"]
@@ -2540,59 +2836,38 @@ def _bbox_attr(bbox: List[float]) -> str:
 
 def _render_table_cell(cell: Dict[str, Any]) -> str:
     """渲染单个表格单元格"""
-    bbox_str = _bbox_attr(cell.get("bbox", []))
     rowspan = int(cell.get("rowspan", 1) or 1)
     colspan = int(cell.get("colspan", 1) or 1)
     text = _escape(cell.get("text", "") or "")
     
-    attrs = [f'data-bbox="{bbox_str}"']
+    attrs = []
     if rowspan > 1:
         attrs.append(f'rowspan="{rowspan}"')
     if colspan > 1:
         attrs.append(f'colspan="{colspan}"')
     
-    return f'<td {" ".join(attrs)}>{text}</td>'
+    if attrs:
+        return f'<td {" ".join(attrs)}>{text}</td>'
+    return f'<td>{text}</td>'
 
 
 def _render_table_content(table_obj: Dict[str, Any]) -> str:
     """
-    渲染表格内部结构 (thead + tbody)
-    
-    评测要求: <table><thead>...</thead><tbody>...</tbody></table>
+    渲染表格内部结构
+
+    评测要求: <table><tr><td>文本</td></tr></table>（不要 thead/tbody）
     """
     rows = table_obj.get("rows", [])
-    
+
     if not rows:
-        # 空表格: 至少输出一个空行
-        return "<table><thead><tr><td></td></tr></thead><tbody></tbody></table>"
-    
-    # 分离表头和表体
-    # 策略: 第一行作为表头，其余作为表体
-    thead_rows = rows[:1] if rows else []
-    tbody_rows = rows[1:] if len(rows) > 1 else []
-    
+        return "<table><tr><td></td></tr></table>"
+
     parts = ["<table>"]
-    
-    # 渲染 thead
-    parts.append("<thead>")
-    for row in thead_rows:
+    for row in rows:
         parts.append("<tr>")
         for cell in row:
             parts.append(_render_table_cell(cell))
         parts.append("</tr>")
-    if not thead_rows:
-        parts.append("<tr><td></td></tr>")
-    parts.append("</thead>")
-    
-    # 渲染 tbody
-    parts.append("<tbody>")
-    for row in tbody_rows:
-        parts.append("<tr>")
-        for cell in row:
-            parts.append(_render_table_cell(cell))
-        parts.append("</tr>")
-    parts.append("</tbody>")
-    
     parts.append("</table>")
     return "".join(parts)
 
@@ -2609,7 +2884,7 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     - 图像: <div class="image" data-bbox="x1 y1 x2 y2"></div>
     - 图表: <div class="chart" data-bbox="x1 y1 x2 y2"></div>
     - 表格: <div class="table" data-bbox="x1 y1 x2 y2"><table>...</table></div>
-    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2">LATEX</div>
+    - 公式: <div class="formula" data-bbox="x1 y1 x2 y2">latex</div>
     - 列表项: <div class="list_item" data-bbox="x1 y1 x2 y2">文本</div>
     - 标题说明: <div class="caption" data-bbox="x1 y1 x2 y2">文本</div>
     - 页眉: <div class="header" data-bbox="x1 y1 x2 y2">文本</div>
@@ -2650,8 +2925,8 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     
     # 公式 — LaTeX 内容作为元素文本，不使用 data-latex 属性
     if btype == "formula":
-        latex = _escape((b.get("latex") or "").strip())
-        return f'<div class="formula" data-bbox="{bbox_str}">{latex}</div>'
+        latex_text = b.get("latex") or b.get("text") or ""
+        return f'<div class="formula" data-bbox="{bbox_str}">{latex_text}</div>'
     
     # 页眉
     if btype == "header":
@@ -2874,7 +3149,11 @@ def process_one(sample: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle
 
     # 6) Formula blocks
     try:
-        ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+        ir["blocks"] = _process_formula_blocks(
+            ir.get("blocks", []),
+            img_path=img_path,
+            recognizer=getattr(models, "formula_recognizer", None),
+        )
     except Exception as e:
         debug["formula_error"] = str(e)[:200]
 
@@ -3012,7 +3291,11 @@ def _run_fallback(ir: Dict[str, Any], cfg: Dict[str, Any], models: ModelBundle, 
 
     # 3) tables + formulas
     ir["tables"] = _extract_tables(ir.get("blocks", []), ocr_lines, img_path, ir.get("page", {}), cfg, models, debug)
-    ir["blocks"] = _process_formula_blocks(ir.get("blocks", []))
+    ir["blocks"] = _process_formula_blocks(
+        ir.get("blocks", []),
+        img_path=img_path,
+        recognizer=getattr(models, "formula_recognizer", None),
+    )
 
     debug["fallback_ms"] = round(_now_ms() - t0, 2)
     return ir, ocr_lines
@@ -3160,79 +3443,84 @@ def _get_block_meta_field(block: Dict[str, Any], field: str, default: float = 0.
 
 def _detect_block_columns(blocks: List[Dict[str, Any]], page: Dict[str, Any]) -> Tuple[int, Dict[int, int]]:
     """
-    检测页面栏布局，支持 1-4 栏
-    
+    检测页面栏布局，支持 1-4 栏。
+
+    优先使用基于投影直方图的稳健栏分割（utils.reading_order），
+    回退到间距分割。
+
     Returns:
         (column_count, {block_id: column_id})
     """
     if not blocks:
         return 1, {}
-    
+
     page_w = max(1.0, float(page.get("width", 1)))
-    
-    # 只用文本块检测，排除 header/footer
-    text_blocks = [b for b in blocks 
+
+    if _HAS_READING_ORDER_UTILS:
+        boundaries = _detect_cols_proj(blocks, page_w)
+        column_map, n_columns = _assign_block_cols(blocks, boundaries)
+        # header/footer: remap to 0 for downstream compatibility
+        for b in blocks:
+            bid = b["id"]
+            if b.get("type") in ("header", "footer"):
+                column_map[bid] = 0
+        return n_columns, column_map
+
+    # Fallback: gap-based detection
+    text_blocks = [b for b in blocks
                    if b.get("type") in ("paragraph", "list_item", "caption", "title")
                    and b.get("type") not in ("header", "footer")]
-    
+
     if len(text_blocks) < 6:
         return 1, {b["id"]: 0 for b in blocks}
-    
-    # 提取中心 x 坐标
+
     centers = []
     for b in text_blocks:
         bbox = b.get("bbox", [0, 0, 0, 0])
         cx = (bbox[0] + bbox[2]) / 2
         centers.append((b["id"], cx))
-    
+
     if not centers:
         return 1, {b["id"]: 0 for b in blocks}
-    
-    # 按 x 排序
+
     centers.sort(key=lambda x: x[1])
     xs = [c[1] for c in centers]
-    
-    # 计算相邻间距
+
     gaps = []
     for i in range(len(xs) - 1):
         gaps.append((xs[i + 1] - xs[i], i))
-    
+
     if not gaps:
         return 1, {b["id"]: 0 for b in blocks}
-    
-    # 找显著间距（大于中位数的 2 倍且大于页宽的 10%）
+
     gap_values = [g[0] for g in gaps]
     median_gap = safe_median(gap_values, default=0.1 * page_w)
-    
+
     significant_gaps = []
     for gap_val, idx in gaps:
         if gap_val > max(2.0 * median_gap, 0.1 * page_w):
             significant_gaps.append((gap_val, idx))
-    
-    # 按间距大小排序，取最多 3 个（支持最多 4 栏）
+
     significant_gaps.sort(key=lambda x: -x[0])
     significant_gaps = significant_gaps[:3]
-    
+
     if not significant_gaps:
         return 1, {b["id"]: 0 for b in blocks}
-    
-    # 计算分割阈值
+
     split_indices = sorted([idx for _, idx in significant_gaps])
     thresholds = [(xs[idx] + xs[idx + 1]) / 2 for idx in split_indices]
-    
+
     n_columns = len(thresholds) + 1
-    
-    # 为所有 blocks 分配 column_id
+
     column_map = {}
     for b in blocks:
-        # header/footer 强制 column_id=0
         if b.get("type") in ("header", "footer"):
             column_map[b["id"]] = 0
             continue
-        
+
         bbox = b.get("bbox", [0, 0, 0, 0])
         cx = (bbox[0] + bbox[2]) / 2
-        
+
         col_id = 0
         for thresh in thresholds:
             if cx > thresh:
@@ -3240,17 +3528,29 @@ def _detect_block_columns(blocks: List[Dict[str, Any]], page: Dict[str, Any]) ->
             else:
                 break
         column_map[b["id"]] = col_id
-    
+
     return n_columns, column_map
 
 
 def _enrich_blocks_with_column_info(blocks: List[Dict[str, Any]], page: Dict[str, Any]) -> None:
-    """为 blocks 添加栏信息到 meta 字段（原地修改）"""
+    """为 blocks 添加栏信息到 meta 字段和顶层属性（原地修改）。
+
+    设置 meta 字段：column_id, column_count, is_first_in_column, is_last_in_column
+    同时设置顶层属性：_column_id, _column_count, _is_first_in_column, _is_last_in_column
+    （顶层属性供 _pair_feature_dict 等函数直接读取）
+    """
     if not blocks:
         return
-    
+
     n_columns, column_map = _detect_block_columns(blocks, page)
-    
+
+    # 计算页面中位数垂直间距（用于 PR4 新特征）
+    page_h = max(1.0, float(page.get("height", 1)))
+    if _HAS_READING_ORDER_UTILS:
+        median_gap = _compute_median_gap(blocks, page_h)
+    else:
+        median_gap = page_h * 0.01
+
     # 按栏分组，并在栏内按 y 排序
     columns: Dict[int, List[Dict[str, Any]]] = {}
     for b in blocks:
@@ -3258,19 +3558,34 @@ def _enrich_blocks_with_column_info(blocks: List[Dict[str, Any]], page: Dict[str
         if col_id not in columns:
             columns[col_id] = []
         columns[col_id].append(b)
-    
+
     # 每栏内按 y 排序，确定 first/last
     for col_id, col_blocks in columns.items():
         col_blocks.sort(key=lambda x: (x.get("bbox", [0, 0, 0, 0])[1], x.get("bbox", [0, 0, 0, 0])[0]))
-        
+
         for i, b in enumerate(col_blocks):
             if "meta" not in b or b["meta"] is None:
                 b["meta"] = {}
-            
+
+            is_first = 1.0 if i == 0 else 0.0
+            is_last = 1.0 if i == len(col_blocks) - 1 else 0.0
+
             b["meta"]["column_id"] = col_id
             b["meta"]["column_count"] = n_columns
-            b["meta"]["is_first_in_column"] = 1.0 if i == 0 else 0.0
-            b["meta"]["is_last_in_column"] = 1.0 if i == len(col_blocks) - 1 else 0.0
+            b["meta"]["is_first_in_column"] = is_first
+            b["meta"]["is_last_in_column"] = is_last
+            b["meta"]["_median_gap"] = float(median_gap)
+
+            # 顶层属性（供 _pair_feature_dict 等读取）
+            b["_column_id"] = col_id
+            b["_column_count"] = n_columns
+            b["_is_first_in_column"] = is_first
+            b["_is_last_in_column"] = is_last
+            b["_median_gap"] = float(median_gap)
+
+    # 将栏数写入 page，供 predict_relations 使用
+    page["_column_count"] = n_columns
+    page["_median_gap"] = float(median_gap)
 
 
 
@@ -3298,7 +3613,7 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
         level = float(block["style"]["heading_level"])
     
     # 计算文本行数���启发式）
-    text_line_count = max(1.0, float(txt.count("") + 1)) if txt.strip() else 0.0
+    text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
     # 计算平均行高（归一化到页高）
     if text_line_count > 0 and bh > 0:
@@ -3357,9 +3672,10 @@ def _block_feature_dict(block: Dict[str, Any], page: Dict[str, Any], height_pct:
 
 
 def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, Any],
-                       column_count: float = 1.0) -> Dict[str, float]:
+                       column_count: float = 1.0,
+                       median_gap: float = None) -> Dict[str, float]:
     """
-    提取 pair 特征，与 train.py 的 PAIR_SCHEMA (34维) 完全对齐
+    提取 pair 特征，与 train.py 的 PAIR_SCHEMA (41维) 完全对齐
     """
     bb1 = b1.get("bbox", [0, 0, 0, 0])
     bb2 = b2.get("bbox", [0, 0, 0, 0])
@@ -3387,35 +3703,35 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
     left_to_right = 1.0 if (same_row > 0.5 and x11 < x21) else 0.0
     is_above = 1.0 if y12 <= y21 else 0.0
     v_gap = max(0.0, y21 - y12)
-    
-    # 获取 column_id（从 block 的 meta 或默认 0）
+
+    # 获取 column_id（从 block 的顶层属性，由 _enrich_blocks_with_column_info 设置）
     u_col_id = float(b1.get("_column_id", 0))
     v_col_id = float(b2.get("_column_id", 0))
     same_column_id = 1.0 if u_col_id == v_col_id else 0.0
     column_diff = max(-3.0, min(3.0, v_col_id - u_col_id))
-    
+
     # 获取文本行数
     u_text = (b1.get("text") or "")
     v_text = (b2.get("text") or "")
-    u_lines = max(1.0, float(u_text.count("") + 1)) if u_text.strip() else 1.0
-    v_lines = max(1.0, float(v_text.count("") + 1)) if v_text.strip() else 1.0
+    u_lines = max(1.0, float(u_text.count("\n") + 1)) if u_text.strip() else 1.0
+    v_lines = max(1.0, float(v_text.count("\n") + 1)) if v_text.strip() else 1.0
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
-    
+
     # 特征字典，顺序必须与 train.py PAIR_SCHEMA 一致
     feats = {
         # 相对位置（3个）
         "dx_norm": dx / w,
         "dy_norm": dy / h,
         "center_dist_norm": dist / math.hypot(w, h),
-        
+
         # 重叠（2个）
         "x_overlap": x_overlap_ratio,
         "y_overlap": y_overlap_ratio,
-        
+
         # 尺寸比例（2个）
         "size_ratio_w": size_ratio_w,
         "size_ratio_h": size_ratio_h,
-        
+
         # 布局关系（6个）
         "same_column": same_col,
         "is_above": is_above,
@@ -3423,17 +3739,17 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "align_diff_right_norm": align_diff_right_norm,
         "same_row": same_row,
         "left_to_right": left_to_right,
-        
+
         # 间距（1个）
         "gap_y_norm": v_gap / h,
-        
+
         # 类型特征（4个）
         "u_is_title": 1.0 if b1.get("type") == "title" else 0.0,
         "v_is_title": 1.0 if b2.get("type") == "title" else 0.0,
         "u_heading_level": float(b1.get("style", {}).get("heading_level", 0) if b1.get("style") else 0.0),
         "v_heading_level": float(b2.get("style", {}).get("heading_level", 0) if b2.get("style") else 0.0),
     }
-    
+
     # 类型 one-hot（10个）
     u_one = _coarse_type_onehot(b1)
     v_one = _coarse_type_onehot(b2)
@@ -3449,7 +3765,7 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "v_caption": v_one["caption"],
         "v_other": v_one["other"],
     })
-    
+
     # ===== 新增特征（6个）与 train.py 对齐 =====
     feats.update({
         "same_column_id": same_column_id,
@@ -3459,7 +3775,22 @@ def _pair_feature_dict(b1: Dict[str, Any], b2: Dict[str, Any], page: Dict[str, A
         "column_count": column_count,
         "text_line_count_ratio": text_line_count_ratio,
     })
-    
+
+    # ===== PR4 新增特征（7个）与 train.py 对齐 =====
+    _median_gap = float(median_gap) if median_gap is not None else float(b1.get("_median_gap", h * 0.01))
+    _median_gap = max(1.0, _median_gap)
+    u_type = b1.get("type", "")
+    v_type = b2.get("type", "")
+    feats.update({
+        "vertical_gap_to_median_ratio": v_gap / _median_gap,
+        "horizontal_gap_norm": abs(cx2 - cx1) / w,
+        "column_distance": abs(v_col_id - u_col_id),
+        "indent_diff_norm": (x21 - x11) / w,
+        "width_ratio": bw2 / (bw1 + 1.0),
+        "u_is_cross_column": 1.0 if bw1 > 0.7 * w else 0.0,
+        "header_footer_penalty": 1.0 if (u_type in ("header", "footer") or v_type in ("header", "footer")) else 0.0,
+    })
+
     return feats
 
 
@@ -3635,74 +3966,92 @@ def _extract_table_structure(table_block: Dict[str, Any], table_lines: List[Dict
 
 def _detect_columns_for_order(blocks: List[Dict[str, Any]], page: Dict[str, Any]) -> Tuple[int, Dict[int, int]]:
     """
-    检测页面栏布局用于阅读顺序（支持 1-4 栏）
-    
+    检测页面栏布局用于阅读顺序（支持 1-4 栏）。
+
+    优先使用基于投影直方图的稳健栏分割，回退到间距分割。
+
     Returns:
         (column_count, {block_index: column_id})
     """
     if not blocks:
         return 1, {}
-    
+
     page_w = max(1.0, float(page.get("width", 1)))
-    
-    # 只用文本块检测，排除 header/footer
-    text_indices = [i for i, b in enumerate(blocks) 
+
+    if _HAS_READING_ORDER_UTILS:
+        boundaries = _detect_cols_proj(blocks, page_w)
+        n_columns = max(1, len(boundaries) - 1)
+        column_map: Dict[int, int] = {}
+        for i, b in enumerate(blocks):
+            if b.get("type") == "header":
+                column_map[i] = -1
+                continue
+            if b.get("type") == "footer":
+                column_map[i] = n_columns
+                continue
+            bbox = b.get("bbox", [0, 0, 0, 0])
+            cx = (bbox[0] + bbox[2]) / 2
+            col_id = 0
+            for thresh in boundaries[1:-1]:
+                if cx > thresh:
+                    col_id += 1
+                else:
+                    break
+            column_map[i] = col_id
+        return n_columns, column_map
+
+    # Fallback: gap-based detection
+    text_indices = [i for i, b in enumerate(blocks)
                     if b.get("type") in ("paragraph", "list_item", "caption", "title")
                     and b.get("type") not in ("header", "footer")]
-    
+
     if len(text_indices) < 6:
         return 1, {i: 0 for i in range(len(blocks))}
-    
-    # 提取中心 x 坐标
+
     centers = []
     for i in text_indices:
         bbox = blocks[i].get("bbox", [0, 0, 0, 0])
         cx = (bbox[0] + bbox[2]) / 2
         centers.append((i, cx))
-    
-    # 按 x 排序
+
     centers.sort(key=lambda x: x[1])
     xs = [c[1] for c in centers]
-    
-    # 计算相邻间距
+
     gaps = []
     for j in range(len(xs) - 1):
         gaps.append((xs[j + 1] - xs[j], j))
-    
+
     if not gaps:
         return 1, {i: 0 for i in range(len(blocks))}
-    
-    # 找显著间距
+
     gap_values = [g[0] for g in gaps]
     median_gap = safe_median(gap_values, default=0.1 * page_w)
-    
+
     significant_gaps = []
     for gap_val, idx in gaps:
         if gap_val > max(2.0 * median_gap, 0.1 * page_w):
             significant_gaps.append((gap_val, idx))
-    
+
     significant_gaps.sort(key=lambda x: -x[0])
     significant_gaps = significant_gaps[:3]
-    
+
     if not significant_gaps:
         return 1, {i: 0 for i in range(len(blocks))}
-    
-    # 计算分割阈值
+
     split_indices = sorted([idx for _, idx in significant_gaps])
     thresholds = [(xs[idx] + xs[idx + 1]) / 2 for idx in split_indices]
-    
+
     n_columns = len(thresholds) + 1
-    
-    # 为所有 blocks 分配 column_id
+
     column_map = {}
     for i, b in enumerate(blocks):
         if b.get("type") in ("header", "footer"):
             column_map[i] = -1 if b.get("type") == "header" else 999
             continue
-        
+
         bbox = b.get("bbox", [0, 0, 0, 0])
         cx = (bbox[0] + bbox[2]) / 2
-        
+
         col_id = 0
         for thresh in thresholds:
             if cx > thresh:
@@ -3710,7 +4059,7 @@ def _detect_columns_for_order(blocks: List[Dict[str, Any]], page: Dict[str, Any]
             else:
                 break
         column_map[i] = col_id
-    
+
     return n_columns, column_map
 
 
