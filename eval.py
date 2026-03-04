@@ -509,6 +509,29 @@ def _union_bbox(bboxes: List[List[float]]) -> List[float]:
     ]
 
 
+def crop_roi(image: Any, bbox: List[float], pad: int = 0) -> Any:
+    """Crop ROI from a PIL Image with optional padding and bbox clamping.
+
+    Args:
+        image: PIL Image object.
+        bbox:  [x1, y1, x2, y2] in pixel coordinates.
+        pad:   Extra pixels to add around the bbox (clamped to image bounds).
+
+    Returns:
+        Cropped PIL Image, or None if bbox is invalid.
+    """
+    if image is None or Image is None:
+        return None
+    w, h = image.size
+    x1 = max(0, int(round(bbox[0])) - pad)
+    y1 = max(0, int(round(bbox[1])) - pad)
+    x2 = min(w, int(round(bbox[2])) + pad)
+    y2 = min(h, int(round(bbox[3])) + pad)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return image.crop((x1, y1, x2, y2))
+
+
 # -----------------------------------------------------------------------------
 # Text stats
 # -----------------------------------------------------------------------------
@@ -1054,13 +1077,16 @@ def _map_to_original_coords(bbox_input_xyxy: List[float], scale: float, pad: Tup
 def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle, debug: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Returns list of {"bbox":[x1,y1,x2,y2], "label":str, "score":float}
+    Falls back to empty list (caller should use OCR fallback) when unavailable.
     """
     t0 = _now_ms()
     if models.layout_detector is None:
+        sys.stderr.write("[warning] Layout detector not available; falling back to OCR-based block detection.\n")
         debug["layout_detector_status"] = "no_model"
         debug["layout_ms"] = 0.0
         return []
     if Image is None or np is None:
+        sys.stderr.write("[warning] Layout detector dependencies (PIL/numpy) missing; falling back.\n")
         debug["layout_detector_status"] = "missing_deps"
         debug["layout_ms"] = 0.0
         return []
@@ -1068,6 +1094,7 @@ def _run_layout_detector(img_path: str, cfg: Dict[str, Any], models: ModelBundle
     try:
         img = Image.open(img_path).convert("RGB")
     except Exception as e:
+        sys.stderr.write(f"[warning] Cannot open image for layout detection ({img_path}): {e}\n")
         debug["layout_detector_status"] = f"image_error:{str(e)[:80]}"
         debug["layout_ms"] = round(_now_ms() - t0, 2)
         return []
@@ -1399,11 +1426,100 @@ def _ocr_roi(img_path: str, roi_bbox: List[float], cfg: Dict[str, Any], models: 
     return lines
 
 
+def _texts_from_ocr_result(result: Any) -> List[str]:
+    """Extract a flat list of non-empty text strings from a PaddleOCR result."""
+    texts: List[str] = []
+    if not result:
+        return texts
+    for item in result:
+        if not item:
+            continue
+        for line in item:
+            if not line or len(line) < 2:
+                continue
+            txt_info = line[1]
+            text = (txt_info[0] if isinstance(txt_info, (list, tuple)) and txt_info
+                    else str(txt_info))
+            if text.strip():
+                texts.append(text.strip())
+    return texts
+
+
+def batch_ocr_blocks(blocks: List[Dict[str, Any]], image: Any,
+                     ocr_engine: Any, batch_size: int = 16) -> List[Dict[str, Any]]:
+    """Batch OCR for text-type blocks using a pre-opened PIL Image.
+
+    Crops all eligible ROIs from the image in one pass and calls OCR per
+    ROI array (avoids repeated image I/O).  Results are written back into
+    each block's ``text`` and ``source`` fields in-place.
+
+    Args:
+        blocks:     List of block dicts with ``type`` and ``bbox`` fields.
+        image:      Already-opened PIL Image of the full page.
+        ocr_engine: PaddleOCR (or compatible) engine instance.
+        batch_size: Number of ROIs to process per batch iteration.
+
+    Returns:
+        The same *blocks* list with ``text``/``source`` updated.
+    """
+    if ocr_engine is None or image is None or np is None:
+        return blocks
+
+    eligible = [(i, b) for i, b in enumerate(blocks) if b.get("type") in TEXT_BLOCK_TYPES]
+    if not eligible:
+        return blocks
+
+    for batch_start in range(0, len(eligible), batch_size):
+        batch = eligible[batch_start:batch_start + batch_size]
+
+        rois: List[Any] = []
+        offsets: List[Tuple[int, int]] = []
+        valid: List[Tuple[int, Dict[str, Any]]] = []
+
+        for i, b in batch:
+            bbox = b.get("bbox", [0, 0, 0, 0])
+            roi = crop_roi(image, bbox)
+            if roi is not None:
+                x1 = max(0, int(round(bbox[0])))
+                y1 = max(0, int(round(bbox[1])))
+                rois.append(np.array(roi))
+                offsets.append((x1, y1))
+                valid.append((i, b))
+
+        if not rois:
+            continue
+
+        # Try a single batch call; fall back to per-image calls if unsupported.
+        batch_results: Optional[List[Any]] = None
+        try:
+            res = ocr_engine.ocr(rois, cls=False)
+            if isinstance(res, list) and len(res) == len(rois):
+                batch_results = res
+        except Exception:
+            pass
+
+        if batch_results is None:
+            batch_results = []
+            for roi_arr in rois:
+                try:
+                    batch_results.append(ocr_engine.ocr(roi_arr, cls=False))
+                except Exception:
+                    batch_results.append(None)
+
+        for result, (x1_off, y1_off), (idx, b) in zip(batch_results, offsets, valid):
+            texts = _texts_from_ocr_result(result)
+            if texts:
+                b["text"] = "\n".join(texts)
+                b["source"] = "roi_ocr"
+
+    return blocks
+
+
 def _enrich_blocks_with_roi_ocr(blocks: List[Dict[str, Any]], img_path: str, page: Dict[str, Any],
                                 cfg: Dict[str, Any], models: ModelBundle, debug: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     ROI OCR on text blocks, returning (blocks, all_lines).
-    This is designed to be fast and conservative (skip very small/noisy blocks).
+    Opens the page image once and reuses it for all ROI crops to reduce I/O.
     """
     t0 = _now_ms()
     all_lines: List[Dict[str, Any]] = []
@@ -1413,11 +1529,56 @@ def _enrich_blocks_with_roi_ocr(blocks: List[Dict[str, Any]], img_path: str, pag
         return blocks, all_lines
 
     page_size = (int(page.get("width", 1000)), int(page.get("height", 1400)))
+
+    # Open the page image once so all ROI crops share the same I/O cost.
+    pil_img: Any = None
+    if Image is not None:
+        try:
+            pil_img = Image.open(img_path).convert("RGB")
+        except Exception:
+            pil_img = None
+
     roi_cnt = 0
     for b in blocks:
         if not _should_do_roi_ocr(b, cfg):
             continue
-        lines = _ocr_roi(img_path, b.get("bbox", [0, 0, 0, 0]), cfg, models, page_size, debug)
+        bbox = b.get("bbox", [0, 0, 0, 0])
+
+        if pil_img is not None and np is not None:
+            # Fast path: crop from pre-opened image, no repeated image I/O.
+            # Compute clamped top-left offset needed to map OCR coords back to
+            # full-page space; crop_roi handles the full clamping internally.
+            x1 = max(0, int(round(bbox[0])))
+            y1 = max(0, int(round(bbox[1])))
+            roi = crop_roi(pil_img, bbox)
+            lines: List[Dict[str, Any]] = []
+            if roi is not None:
+                try:
+                    result = models.ocr_engine.ocr(np.array(roi), cls=False)
+                    if result:
+                        for item in result:
+                            if not item:
+                                continue
+                            for ln in item:
+                                if not ln or len(ln) < 2:
+                                    continue
+                                quad = ln[0]
+                                txt_info = ln[1]
+                                text = (txt_info[0] if isinstance(txt_info, (list, tuple)) and txt_info
+                                        else str(txt_info))
+                                xs = [p[0] for p in quad]
+                                ys = [p[1] for p in quad]
+                                lines.append({
+                                    "bbox": [float(min(xs) + x1), float(min(ys) + y1),
+                                             float(max(xs) + x1), float(max(ys) + y1)],
+                                    "text": text,
+                                })
+                except Exception:
+                    lines = []
+        else:
+            # Slow-path fallback: let _ocr_roi open the image itself.
+            lines = _ocr_roi(img_path, bbox, cfg, models, page_size, debug)
+
         if lines:
             roi_cnt += 1
             all_lines.extend(lines)
@@ -1611,6 +1772,7 @@ def build_ir_candidates(sample: Dict[str, Any], cfg: Dict[str, Any], models: Mod
         ir["blocks"] = _group_lines_to_paragraphs(lines)
         debug["blocks_source"] = "ocr_full_grouped"
     else:
+        sys.stderr.write(f"[warning] No layout detection or OCR output for {image_path}; using full-page paragraph fallback.\n")
         ir["blocks"] = [{
             "id": 0,
             "bbox": [0, 0, w, h],
@@ -2744,13 +2906,9 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
     if btype == "list_item":
         return f'<div class="list_item" data-bbox="{bbox_str}">{text}</div>'
     
-    # 标题说明 (caption)
+    # 标题说明 (caption) — 不添加额外属性，阅读顺序由标签出现顺序决定
     if btype == "caption":
-        # 可选: 添加 data-ref 属性指向关联的 figure/table
-        ref_attr = ""
-        if caption_ref is not None:
-            ref_attr = f' data-ref="{caption_ref}"'
-        return f'<div class="caption" data-bbox="{bbox_str}"{ref_attr}>{text}</div>'
+        return f'<div class="caption" data-bbox="{bbox_str}">{text}</div>'
     
     # 图像 (figure -> image)
     if btype == "figure":
@@ -2765,7 +2923,7 @@ def _render_block(b: Dict[str, Any], caption_ref: Optional[int],
         table_content = _render_table_content(table_obj or {})
         return f'<div class="table" data-bbox="{bbox_str}">{table_content}</div>'
     
-    # 公式
+    # 公式 — LaTeX 内容作为元素文本，不使用 data-latex 属性
     if btype == "formula":
         latex_text = b.get("latex") or b.get("text") or ""
         return f'<div class="formula" data-bbox="{bbox_str}">{latex_text}</div>'
@@ -3251,6 +3409,21 @@ def write_debug_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_jsonl(records: List[Dict[str, Any]], output_path: str) -> None:
+    """Write inference results to a JSONL file.
+
+    Each line is a complete JSON object containing ``image``, ``prompt``,
+    and ``answer`` fields.  ``ensure_ascii=False`` is used so that CJK
+    characters are stored verbatim rather than as escape sequences.
+
+    Args:
+        records:     List of result dicts (must have ``image`` and ``answer``).
+        output_path: Destination file path.
+    """
+    write_submit_jsonl(output_path, records)
+
 
 
 
