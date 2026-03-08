@@ -112,6 +112,11 @@ class TestRenderBlock(unittest.TestCase):
         # td must not have data-bbox
         self.assertNotIn('<td data-bbox', html)
 
+    def test_page_number_block(self):
+        block = {"type": "page_number", "bbox": [100, 900, 180, 930], "text": "-2-"}
+        html = _render_block(block, None, None)
+        self.assertIn('<div class="page_number" data-bbox="100 900 180 930">-2-</div>', html)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

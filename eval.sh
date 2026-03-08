@@ -7,10 +7,16 @@ INPUT_DATA="./datasets/label/eval.jsonl"
 IMAGE_ROOT="./datasets/image"
 RESULT_FILE="./eval_results/results.jsonl"
 
-# 环境激活
-CONDA_PATH=$(conda info --base)
-source "$CONDA_PATH/etc/profile.d/conda.sh"
-conda activate docparse
+# 环境激活（优先项目内 .venv，其次 conda）
+if [ -f "./.venv/bin/activate" ]; then
+    source "./.venv/bin/activate"
+elif command -v conda >/dev/null 2>&1; then
+    CONDA_PATH=$(conda info --base)
+    source "$CONDA_PATH/etc/profile.d/conda.sh"
+    conda activate docparse
+else
+    echo "⚠️ 未检测到 .venv 或 conda，使用系统 Python。"
+fi
 
 mkdir -p "$(dirname "$RESULT_FILE")"
 

@@ -25,6 +25,9 @@ from eval import (
     _nms_python,
     _postprocess_header_footer,
     _run_layout_detector,
+    _looks_like_page_number_text,
+    _promote_page_number_blocks,
+    _beam_search_order,
     ModelBundle,
 )
 
@@ -208,6 +211,38 @@ class TestRunLayoutDetectorNoModel(unittest.TestCase):
         status = debug.get("layout_detector_status", "")
         # Could be "image_error" (PIL available) or "missing_deps" (PIL absent)
         self.assertNotEqual(status, "ok")
+
+
+class TestPageNumberHeuristics(unittest.TestCase):
+    def test_page_number_regex(self):
+        self.assertTrue(_looks_like_page_number_text("-2-"))
+        self.assertTrue(_looks_like_page_number_text("第12页"))
+        self.assertTrue(_looks_like_page_number_text("Page 3"))
+        self.assertFalse(_looks_like_page_number_text("这是正文段落，不是页码"))
+
+    def test_promote_page_number_blocks(self):
+        ir = {
+            "page": {"width": 1000, "height": 1400},
+            "blocks": [
+                {"id": 0, "type": "footer", "bbox": [460, 1320, 540, 1360], "text": "-2-"},
+                {"id": 1, "type": "paragraph", "bbox": [80, 200, 920, 320], "text": "正文内容"},
+            ],
+            "debug": {},
+        }
+        out = _promote_page_number_blocks(ir)
+        self.assertEqual(out["blocks"][0]["type"], "page_number")
+        self.assertEqual(out["blocks"][1]["type"], "paragraph")
+        self.assertEqual(out["debug"].get("page_number_promoted"), 1)
+
+
+class TestBeamSearchOrdering(unittest.TestCase):
+    def test_starts_from_top_left(self):
+        blocks = [
+            {"id": 0, "bbox": [10, 20, 100, 40], "type": "paragraph"},
+            {"id": 1, "bbox": [10, 900, 100, 940], "type": "footer"},
+        ]
+        order = _beam_search_order(blocks, {0: [], 1: []}, {}, beam_width=2)
+        self.assertEqual(order[0], 0)
 
 
 if __name__ == "__main__":

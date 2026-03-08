@@ -56,6 +56,27 @@ models:
       enabled: true
       version: "PP-OCRv4"
       lang: "ch"
+      text_det_limit_side_len: 1280
+      text_rec_score_thresh: 0.40
+      line_score_threshold: 0.40
+      line_min_text_len: 2
+      full_image_max_side: 1600
+      reuse_full_image_for_layout: true
+      reuse_min_blocks: 1
+      roi_types: ["paragraph", "title", "list_item"]
+    table_refiner:
+      enabled: true
+      min_area_ratio: 0.005
+      max_side: 1400
+    formula_ocr:
+      openai_54:
+        enabled: false
+        model: "openai-5.4"
+        base_url: "https://api.openai.com/v1"
+        api_key_env: "OPENAI_API_KEY"
+        timeout_s: 20
+        max_side: 1024
+        max_calls_per_page: 0
 
 decode:
   k_order: 12                      # 增加搜索邻域，提升 Recall
@@ -69,7 +90,7 @@ decode:
 
   fallback_trigger:
     enabled: true
-    min_blocks: 999
+    min_blocks: 3
     max_empty_text_block_ratio: 0.0
     trigger_detector: true
     trigger_ocr: true
@@ -86,6 +107,16 @@ profiles:
         nms_class_aware: true
         second_pass: false
         hf_correction: false
+      ocr:
+        text_det_limit_side_len: 1024
+        text_rec_score_thresh: 0.45
+        line_score_threshold: 0.45
+        line_min_text_len: 2
+        full_image_max_side: 1440
+      table_refiner:
+        enabled: true
+        min_area_ratio: 0.006
+        max_side: 1120
 
   balanced:
     fallback_models:
@@ -95,6 +126,16 @@ profiles:
         nms_class_aware: true
         second_pass: false
         hf_correction: false
+      ocr:
+        text_det_limit_side_len: 1280
+        text_rec_score_thresh: 0.40
+        line_score_threshold: 0.40
+        line_min_text_len: 2
+        full_image_max_side: 1600
+      table_refiner:
+        enabled: true
+        min_area_ratio: 0.005
+        max_side: 1400
 
   accurate:
     fallback_models:
@@ -109,3 +150,13 @@ profiles:
         second_pass_min_avg_score: 0.3
         second_pass_input_size: 1280
         second_pass_score_threshold: 0.15
+      ocr:
+        text_det_limit_side_len: 1536
+        text_rec_score_thresh: 0.35
+        line_score_threshold: 0.35
+        line_min_text_len: 1
+        full_image_max_side: 1920
+      table_refiner:
+        enabled: true
+        min_area_ratio: 0.004
+        max_side: 1600

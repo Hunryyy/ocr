@@ -1,1 +1,33 @@
-__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime / cache / temp
+cache/
+tmp/
+output/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local downloaded weights / checkpoints
+*.onnx
+*.pdparams
+*.pdmodel
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
