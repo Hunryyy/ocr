@@ -2,94 +2,58 @@
 
 A modular multimodal OCR / document parsing repository for structured documents, page layout analysis, HTML rendering, and lightweight evaluation.
 
-This project is **not positioned as a closed-box end-to-end VLM parser**. Instead, it is built as a **debuggable, locally reproducible OCR engineering stack** with explicit components for:
+This repository focuses on a **locally reproducible OCR pipeline** with explicit stages for:
 
 - layout detection
 - OCR text recognition
+- relation / reading-order decoding
 - table HTML rendering
-- formula-region handling hooks
-- reading-order / relation decoding
 - proxy scoring and sanity checks
-
-The current repository has already been pushed with code, configs, docs, and datasets, while excluding machine-specific environment artifacts such as `.venv/`, `cache/`, and `tmp/`.
 
 ---
 
 ## Highlights
 
-- **Modular pipeline** rather than monolithic black-box parsing
-- **Layout-first parsing** with PaddleX / PaddleOCR based fallback chain
-- **Table HTML rendering tests** and layout detector tests included
-- **Proxy scorer** (`scripts/score_proxy.py`) for fast iteration before official evaluation
-- **End-to-end sanity check** script for real image inference
-- **Datasets included** in the repository for local debugging / reproduction
+- Modular pipeline instead of a black-box parser
+- Layout-first parsing with PaddleX / PaddleOCR based runtime
+- Table HTML rendering tests and layout detector tests included
+- End-to-end sanity check script for real-image inference
+- Proxy scorer for fast local iteration
+- Datasets included for local debugging and evaluation
 
 ---
 
-## Positioning
+## Measured Snapshots
 
-This README is written in a style inspired by repositories such as **MonkeyOCR** and **dots.ocr**, but the project scope is different.
+Below are **real measured results from the current repository state**.
 
-### Where this repo sits
-
-| Project | Main style | Core idea | Strength | Current repo relation |
-|---|---|---|---|---|
-| MonkeyOCR | end-to-end LMM / document parser | SRR-style document parsing with strong benchmark presentation | strong document parsing benchmarks and model packaging | a reference for presentation style and benchmark framing |
-| dots.ocr | single VLM-style multilingual parser | benchmark-heavy universal parsing with strong leaderboard emphasis | multilingual parsing and broad benchmark coverage | a reference for README structure and comparison framing |
-| **this repo** | modular OCR engineering stack | inspectable layout + OCR + decoding + rendering pipeline | local reproducibility, debugging, controllable evaluation, code-level iteration | **not an apples-to-apples SOTA claim** |
-
-### Important note
-
-This repository **does not claim SOTA against MonkeyOCR or dots.ocr**.
-
-Those projects are benchmark-centric model releases; this repository is currently a **work-in-progress engineering pipeline** focused on:
-
-1. getting the full parsing stack to run locally,
-2. improving controllability and observability,
-3. keeping evaluation scripts and unit tests inside the repo,
-4. iterating toward stronger document parsing quality.
-
----
-
-## Internal Evaluation Snapshot
-
-Below are **real internal measurements currently available in this repo**.
-
-### 1) Unit tests
+### Unit Tests
 
 ```text
 34 tests passed
 ```
 
-Verified with:
+Run with:
 
 ```bash
 python -m unittest tests.test_layout_detector tests.test_table_html
 ```
 
-What these tests cover:
-- DocLayout-YOLO output parsing
-- class-aware NMS
-- header/footer post-correction
-- no-model fallback behavior
-- page-number heuristics
-- table cell rendering and HTML structure
+### Single-Image Sanity Check
 
-### 2) End-to-end sanity check (single image)
+Observed on one real sample image:
 
-Observed on one real sample image with the current config:
-
-- **non-empty output produced**
+- non-empty output produced
 - `blocks_source = layout_detector`
 - `blocks_count = 12`
 - `tables_count = 0`
-- `total_time ≈ 39.02s wall time` in the one-sample check
+- wall time ≈ `39.02s`
 
-This confirms that the pipeline is **not just code-complete** — it already runs inference end-to-end and emits HTML.
+This confirms that the pipeline already runs end-to-end and emits structured HTML.
 
-### 3) 5-image micro-benchmark (internal proxy evaluation)
+### 5-Image Proxy Evaluation
 
-A 5-image micro-benchmark was run on the current branch using:
+Command:
 
 ```bash
 python eval.py \
@@ -117,7 +81,7 @@ Results:
 | Reading-order proxy (`K_order`) | 0.6371 |
 | **Weighted proxy score** | **0.2699** |
 
-### 4) Runtime snapshot for the 5-image run
+### Runtime Snapshot (5 Images)
 
 | Item | Value |
 |---|---:|
@@ -128,18 +92,11 @@ Results:
 | Fallback triggered | 0 / 5 |
 | Block source | layout detector for all 5 |
 
-Interpretation:
-- the stack is already operational,
-- cold-start overhead is noticeable,
-- warm runs are materially faster,
-- quality is still far from a polished production parser,
-- current failure modes are mostly about **duplicate blocks / duplicate labels / weak structure normalization**, not “cannot run at all”.
-
 ---
 
-## Current Qualitative Status
+## Current Status
 
-### What is already working
+### Working
 
 - local inference runs successfully
 - layout detector path is active
@@ -147,18 +104,17 @@ Interpretation:
 - HTML is produced
 - unit tests pass
 - proxy scorer works
-- repository is cloneable and inspectable
 
-### What is still weak
+### Not Yet Strong Enough
 
-- duplicate detections leak into final HTML
+- duplicate detections can leak into final HTML
 - headings / captions can be over-produced
-- formula and table quality are not demonstrated by the current 5-image slice
-- the current proxy score is **usable for iteration**, but not yet competitive with benchmark-oriented parsing systems
+- formula and table quality are still weak in the current measured slice
+- current quality is good enough for iteration, but not yet good enough for a polished parser
 
 In short:
 
-> **The pipeline has crossed the “runs end-to-end” threshold, but it has not yet crossed the “high-quality document parser” threshold.**
+> The pipeline has already crossed the **runs end-to-end** threshold, but it has not yet crossed the **high-quality parser** threshold.
 
 ---
 
@@ -179,14 +135,14 @@ Image / Page
    └─► HTML rendering + debug statistics
 ```
 
-Main implementation entry points:
+Main entry points:
 
 - `eval.py` — main inference / evaluation entry
 - `scripts/sanity_check.py` — end-to-end sanity runner
 - `scripts/score_proxy.py` — lightweight proxy scorer
 - `scripts/smoke_layout_detector.py` — layout smoke test
 - `tests/test_layout_detector.py` — layout detector unit tests
-- `tests/test_table_html.py` — HTML/table rendering unit tests
+- `tests/test_table_html.py` — table / HTML rendering unit tests
 
 ---
 
@@ -194,21 +150,15 @@ Main implementation entry points:
 
 ```text
 ocr/
-├── datasets/                     # images + labels for local evaluation/debugging
-├── docs/                         # integration notes
-├── eval.py                       # main parsing / inference entry
-├── eval.sh                       # helper shell entry
-├── merge_lora.py                 # model merge utility
-├── models/                       # lightweight config/model mapping files
+├── datasets/
+├── eval.py
+├── eval.sh
+├── merge_lora.py
+├── models/
 ├── README.md
 ├── requirements.txt
 ├── scripts/
-│   ├── sanity_check.py
-│   ├── score_proxy.py
-│   └── smoke_layout_detector.py
 ├── tests/
-│   ├── test_layout_detector.py
-│   └── test_table_html.py
 ├── train.py
 ├── train.sh
 ├── trainer/
@@ -219,10 +169,10 @@ ocr/
 
 ## Installation
 
-### Recommended environment
+### Recommended Environment
 
 - Python **3.12**
-- Linux (validated in the current workspace)
+- Linux
 - GPU recommended for practical runtime
 
 ### Setup
@@ -235,29 +185,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Notes on weights
+### Notes on Runtime
 
-This repository does **not** ship local machine environments or downloaded runtime caches.
+The repository does not bundle local virtual environments or runtime caches.
 
-However, the current stack can still be made runnable after clone because:
-- the code is included,
-- the configs are included,
-- the datasets are included,
-- PaddleX / PaddleOCR can auto-download required official models on first run when network access is available.
-
-Optional custom ONNX layout weights are **not bundled**.
+However, after clone, the project can still be made runnable because:
+- code is included
+- configs are included
+- datasets are included
+- PaddleX / PaddleOCR can download required official runtime models on first run when network access is available
 
 ---
 
 ## Quick Start
 
-### 1. Run unit tests
+### 1. Run Unit Tests
 
 ```bash
 python -m unittest tests.test_layout_detector tests.test_table_html
 ```
 
-### 2. Run a sanity check on one image
+### 2. Run a Sanity Check on One Image
 
 ```bash
 python scripts/sanity_check.py \
@@ -266,7 +214,36 @@ python scripts/sanity_check.py \
   --output /tmp/sanity_output.jsonl
 ```
 
-### 3. Run the main parser
+### 3. Run Evaluation via Shell Wrapper
+
+```bash
+bash eval.sh
+```
+
+By default, `eval.sh` uses:
+- `trainer/config/config.yaml`
+- `datasets/label/eval.jsonl`
+- `datasets/image/eval`
+
+You can also dry-run the wrapper:
+
+```bash
+DRY_RUN=1 bash eval.sh
+```
+
+You can override them:
+
+```bash
+CONFIG_FILE=./trainer/config/config.yaml \
+INPUT_DATA=./datasets/label/eval.jsonl \
+IMAGE_ROOT=./datasets/image/eval \
+RESULT_FILE=./eval_results/results.jsonl \
+DEBUG_FILE=./eval_results/debug.jsonl \
+PARALLEL=1 \
+bash eval.sh
+```
+
+### 4. Run the Main Parser Directly
 
 ```bash
 python eval.py \
@@ -277,7 +254,25 @@ python eval.py \
   --debug-output debug.jsonl
 ```
 
-### 4. Run the proxy scorer
+### 5. Run Training via Shell Wrapper
+
+```bash
+bash train.sh
+```
+
+Dry-run the training wrapper before launching a real training job:
+
+```bash
+DRY_RUN=1 bash train.sh
+```
+
+Default training paths:
+- `datasets/label/train.jsonl`
+- `datasets/image/train`
+- `output/train_workdir`
+- `artifacts_v2`
+
+### 6. Run Proxy Scoring
 
 ```bash
 python scripts/score_proxy.py \
@@ -287,90 +282,56 @@ python scripts/score_proxy.py \
 
 ---
 
-## Comparison Notes vs MonkeyOCR / dots.ocr
+## Qualitative Examples
 
-### Inspired by them
+### Example A — Input Page
 
-This README intentionally borrows the following good practices seen in strong OCR repositories:
+![Example A Input](datasets/image/eval/f850e9fc-a4f8-4393-8f6c-ae6c21abdffc.jpg)
 
-- public benchmark snapshots
-- explicit “what works / what does not” framing
-- install + inference + evaluation sections
-- model-positioning discussion instead of vague marketing
+### Example A — Output Snippet
 
-### What we do differently
+```html
+<body>
+  <div class="image" data-bbox="346 197 459 259"></div>
+  <div class="caption" data-bbox="380 286 554 331"></div>
+  <p data-bbox="478 226 541 250">PART</p>
+  <h2 data-bbox="380 286 554 331">品牌介绍</h2>
+  <h2 data-bbox="295 369 638 397">（品牌简介和品牌目标客群）</h2>
+</body>
+```
 
-Unlike MonkeyOCR or dots.ocr, this repository currently emphasizes:
+### Example B — Input Page
 
-- **pipeline transparency** over monolithic model packaging
-- **local debugging** over leaderboard storytelling
-- **proxy scoring** over benchmark-only presentation
-- **component-level tests** over pure demo-driven release
+![Example B Input](datasets/image/eval/ea39110d-a18c-4bad-8aff-181b8ec610dc.jpg)
 
-### Honest comparison
+### Example B — Output Snippet
 
-If you want:
-- **state-of-the-art benchmark chasing**, MonkeyOCR / dots.ocr are much closer to that world today.
-- **hackable code paths, local iteration, explicit scripts, and inspectable failure modes**, this repository is a more natural engineering playground.
+```html
+<body>
+  <p data-bbox="70 54 204 89">目标市场</p>
+  <h2 data-bbox="66 110 297 140">深入了解目标市场</h2>
+  <h2 data-bbox="218 419 395 449">01
+年轻职业人群</h2>
+  <p data-bbox="275 464 472 497">年龄在 25-35 岁之间，工作压力</p>
+</body>
+```
+
+These examples are included to show the **current behavior of the pipeline** rather than an idealized final target.
 
 ---
 
 ## Known Limitations
 
-- current README metrics are **internal proxy metrics**, not official benchmark submissions
-- current quality is still limited by duplicate block generation and incomplete structure cleanup
-- table / formula quality are not yet well represented by the current 5-image slice
-- current layout path relies on runtime-downloaded dependencies unless custom weights are provided manually
-- the config file currently mixes “PaddleOCR v4” wording with runtime behavior that loads newer official Paddle models; this should be cleaned up in future iterations
+- current benchmark section uses internal **proxy metrics**, not official leaderboard submissions
+- duplicate blocks and duplicate labels still need cleanup
+- table / formula quality is not yet strong
+- current config wording and runtime-loaded model naming are not fully cleaned up yet
 
 ---
 
 ## Roadmap
 
-Short-term:
 - reduce duplicate blocks in rendered HTML
-- tighten class normalization for title / caption / image overlap
-- stabilize formula and table parsing paths
-- improve README benchmark reporting with larger reproducible slices
-
-Mid-term:
-- stronger structure-aware evaluation
-- cleaner warm-start / runtime profile
-- more realistic document subsets for internal reporting
-
-Long-term:
-- move from “pipeline runs” to “pipeline scores well and renders cleanly”
-
----
-
-## Docs
-
-- `docs/doclayout_yolo.md`
-- `docs/doclayout_yolo_integration.md`
-
----
-
-## Included vs Excluded in GitHub
-
-### Included
-- source code
-- configs
-- docs
-- datasets
-- tests
-- proxy scoring / sanity scripts
-
-### Excluded
-- `.venv/`
-- `cache/`
-- `tmp/`
-- machine-specific runtime artifacts
-- local downloaded large model files
-
----
-
-## Acknowledgement
-
-This repository has been iterated as an engineering-first OCR project, with ongoing local improvements to layout parsing, HTML rendering, sanity-check coverage, and proxy scoring.
-
-If you are looking for a strong benchmark-oriented parser, check the public work from **MonkeyOCR** and **dots.ocr**. If you are looking for a repository you can clone, inspect, debug, and keep improving step by step, this repo is aimed exactly at that workflow.
+- improve structure cleanup for title / caption / image overlap
+- improve formula and table parsing quality
+- expand measured evaluation beyond the current micro-benchmark
