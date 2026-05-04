@@ -1,5 +1,5 @@
 # ============================================================================
-# 多模态文档解析流水线配置文件 - 性能优化版
+# Multimodal document parsing pipeline config (performance-oriented)
 # ============================================================================
 
 profile: "balanced"
@@ -8,20 +8,20 @@ io:
   image_root: "./data/images"
   output_dir: "./output"
   cache_dir: "./cache"
-  enable_cache: true               # 笔记本运行必开，避免重复 OCR
+  enable_cache: true               # Enable cache to avoid repeated OCR
   log_level: "INFO"
 
 runtime:
   device: "auto"
-  num_workers: 2                   # 针对 ThinkBook 内存保护，不建议调高
+  num_workers: 2                   # Conservative default for memory safety
   use_fp16: true
-  lazy_load_fallback: true         # 只有逻辑模型失效时才加载检测器
+  lazy_load_fallback: true         # Load fallback detectors only when needed
 
 models:
-  # 必须与 train.py 生成的文件名严格一致
+  # File names must match train.py outputs.
   logic_models:
     block_classifier: "block_classifier.json"
-    relation_scorer: "relation_scorer_order.json" # 修正：日志显示生成的是这个名字
+    relation_scorer: "relation_scorer_order.json" # Produced name in training logs
     relation_scorer_caption: "relation_scorer_caption.json"
   
   feature_schemas:
@@ -35,6 +35,13 @@ models:
       type: "yolo"
       version: "yolov8n"
       score_threshold: 0.25
+      postprocess:
+        nested_suppression: true
+        nested_iou_threshold: 0.92
+        nested_containment_threshold: 0.94
+        title_paragraph_refine: true
+        title_boost_ratio: 1.35
+        paragraph_boost_ratio: 1.05
       # --- DocLayout-YOLO / ONNX settings (set enabled: true and uncomment path/class_map to use) ---
       # path: "./models/doclayout_yolo.onnx"      # path to ONNX weight file (≤150 MB)
       # class_map: "./trainer/config/layout_class_map.json"  # index->label mapping
@@ -64,11 +71,29 @@ models:
       reuse_full_image_for_layout: true
       reuse_min_blocks: 1
       roi_types: ["paragraph", "title", "list_item"]
+      text_correction:
+        enabled: true
+        use_phrase_rules: true
+        use_domain_terms: true
+        use_char_lm: true
+        normalize_punctuation: false
     table_refiner:
       enabled: true
       min_area_ratio: 0.005
       max_side: 1400
+      transformer:
+        enabled: false
+        backend: "hf_vision2seq"
+        model_name_or_path: "microsoft/table-transformer-structure-recognition"
+        max_new_tokens: 512
+        prompt: "Output HTML table with rowspan/colspan only."
     formula_ocr:
+      transformer:
+        enabled: false
+        backend: "hf_vision2seq"
+        model_name_or_path: "facebook/nougat-small"
+        max_new_tokens: 256
+        prompt: "Read this formula and output pure LaTeX."
       openai_54:
         enabled: false
         model: "openai-5.4"
@@ -79,14 +104,30 @@ models:
         max_calls_per_page: 0
 
 decode:
-  k_order: 12                      # 增加搜索邻域，提升 Recall
+  k_order: 12                      # Expand neighborhood to improve recall
   k_caption: 5
   use_beam_search: true
-  beam_width: 5                    # 增加束搜索宽度，优化顺序
+  beam_width: 5                    # Wider beam for ordering robustness
   
-  # 关键优化：针对你 0.41 的召回率，降低阈值
+  # Lower thresholds to improve recall on difficult pages.
   order_score_threshold: 0.20     
   caption_score_threshold: 0.35
+
+  reading_order_hybrid:
+    enabled: true
+    projection_bins: 128
+    min_gap_ratio: 0.045
+    low_occupancy_ratio: 0.06
+    max_cuts_per_level: 2
+    max_depth: 8
+    vertical_bias: 1.15
+    cross_span_ratio: 0.72
+    row_tol_ratio: 0.35
+    row_tol_px: 6
+    edge_min_score: 0.55
+    overlap_iou_threshold: 0.35
+    overlap_failure_ratio: 0.28
+    default_edge_score: 0.95
 
   fallback_trigger:
     enabled: true
