@@ -5,9 +5,10 @@ Document Layout Analysis - Training Script
 ==========================================
 训练 Block 分类器、Reading Order 关系模型、Caption 匹配模型
 
-Schema Version: 2.0
+Schema Version: 2.2
 - 新增 Block 特征：column_id, column_count, is_first/last_in_column, text_line_count, avg_line_height_norm
 - 新增 Pair 特征：same_column_id, column_diff, u/v_column_id, text_line_count_ratio
+- 新增高级空间拓扑特征：relative_angle, bbox_iou, center_l1_norm, same_physical_column, reading_flow_score
 - 改进负样本策略：跨栏负样本、同栏跳跃负样本、困难近邻负样本
 """
 
@@ -37,38 +38,42 @@ except ImportError:
     cKDTree = None
 
 try:
-    import os as _os
-    import sys as _sys
-    _utils_dir = _os.path.dirname(_os.path.abspath(__file__))
-    if _utils_dir not in _sys.path:
-        _sys.path.insert(0, _utils_dir)
-    from utils.reading_order import (
+    from order_features import compute_advanced_pair_features
+except Exception:
+    def compute_advanced_pair_features(u: Dict[str, Any], v: Dict[str, Any], page: Dict[str, Any]) -> Dict[str, float]:  # type: ignore
+        return {}
+
+try:
+    from reading_order import (
         detect_columns_by_projection,
         assign_block_columns,
         compute_page_median_gap,
     )
     _HAS_READING_ORDER_UTILS = True
 except Exception:
-    _HAS_READING_ORDER_UTILS = False
-    detect_columns_by_projection = None  # type: ignore
-    assign_block_columns = None  # type: ignore
-    compute_page_median_gap = None  # type: ignore
+    try:
+        from utils.reading_order import (  # type: ignore
+            detect_columns_by_projection,
+            assign_block_columns,
+            compute_page_median_gap,
+        )
+        _HAS_READING_ORDER_UTILS = True
+    except Exception:
+        _HAS_READING_ORDER_UTILS = False
+        detect_columns_by_projection = None  # type: ignore
+        assign_block_columns = None  # type: ignore
+        compute_page_median_gap = None  # type: ignore
 
 
-# =============================================================================
-# 常量与 Schema 定义
-# =============================================================================
 
-SCHEMA_VERSION = "2.1"  # PR4: projection-based column detection, 7 new pair features
+SCHEMA_VERSION = "2.3"  # Enhanced features: spatial context and reading flow
 
 LABEL_MAP = [
     "title", "paragraph", "list_item", "caption", "table", "figure",
     "formula", "header", "footer", "chart", "unknown"
 ]
 
-# Block 特征 Schema（23 -> 29 个特征）
 BLOCK_SCHEMA = [
-    # 位置与尺寸（8个）
     ("rel_x1", "float32"),
     ("rel_y1", "float32"),
     ("rel_x2", "float32"),
@@ -78,7 +83,6 @@ BLOCK_SCHEMA = [
     ("area_ratio", "float32"),
     ("aspect", "float32"),
     
-    # 文本统计（8个）
     ("text_len", "float32"),
     ("digit_ratio", "float32"),
     ("upper_ratio", "float32"),
@@ -88,63 +92,54 @@ BLOCK_SCHEMA = [
     ("is_alnum", "float32"),
     ("ch_ratio", "float32"),
     
-    # 样式（1个）
     ("heading_level", "float32"),
     
-    # 来源（3个）
     ("src_object", "float32"),
     ("src_ocr", "float32"),
     ("src_heur", "float32"),
     
-    # 位置区域（2个）
     ("y_top_region", "float32"),
     ("y_bottom_region", "float32"),
     
-    # 高度百分位（1个）
     ("height_percentile", "float32"),
     
-    # ===== 新增特征（6个） =====
-    ("column_id", "float32"),           # 所属栏 ID（0,1,2...）
-    ("column_count", "float32"),        # 页面总栏数
-    ("is_first_in_column", "float32"),  # 是否为栏内第一个块
-    ("is_last_in_column", "float32"),   # 是否为栏内最后一个块
-    ("text_line_count", "float32"),     # 文本行数
-    ("avg_line_height_norm", "float32"), # 平均行高（归一化到页高）
+    ("column_id", "float32"),           # Column id (0,1,2,...)
+    ("column_count", "float32"),        # Total column count on page
+    ("is_first_in_column", "float32"),  # First block in column
+    ("is_last_in_column", "float32"),   # Last block in column
+    ("text_line_count", "float32"),     # Estimated text line count
+    ("avg_line_height_norm", "float32"), # Mean line height normalized by page height
+    ("rel_y_in_column", "float32"),     # Normalized Y position within column
+    ("dist_to_left_margin", "float32"), # Distance to left column boundary
+    ("dist_to_right_margin", "float32"),# Distance to right column boundary
+    ("vertical_density", "float32"),    # Count of blocks within ±0.1 page_height
 ]
 
-# Pair 特征 Schema（28 -> 34 个特征）
 PAIR_SCHEMA = [
-    # 相对位置（3个）
     ("dx_norm", "float32"),
     ("dy_norm", "float32"),
     ("center_dist_norm", "float32"),
     
-    # 重叠（2个）
     ("x_overlap", "float32"),
     ("y_overlap", "float32"),
     
-    # 尺寸比例（2个）
     ("size_ratio_w", "float32"),
     ("size_ratio_h", "float32"),
     
-    # 布局关系（6个）
-    ("same_column", "float32"),         # 几何启发式同栏
+    ("same_column", "float32"),         # Geometric same-column heuristic
     ("is_above", "float32"),
     ("align_diff_left_norm", "float32"),
     ("align_diff_right_norm", "float32"),
     ("same_row", "float32"),
     ("left_to_right", "float32"),
     
-    # 间距（1个）
     ("gap_y_norm", "float32"),
     
-    # 类型特征（4个）
     ("u_is_title", "float32"),
     ("v_is_title", "float32"),
     ("u_heading_level", "float32"),
     ("v_heading_level", "float32"),
     
-    # 类型 one-hot（10个）
     ("u_text", "float32"),
     ("u_table", "float32"),
     ("u_figure", "float32"),
@@ -156,32 +151,37 @@ PAIR_SCHEMA = [
     ("v_caption", "float32"),
     ("v_other", "float32"),
     
-    # ===== 新增特征（6个） =====
-    ("same_column_id", "float32"),      # 基于 column_id 的同栏判断
+    ("same_column_id", "float32"),      # Same-column flag based on column_id
     ("column_diff", "float32"),         # v_col - u_col
-    ("u_column_id", "float32"),         # u 的栏 ID
-    ("v_column_id", "float32"),         # v 的栏 ID
-    ("column_count", "float32"),        # 页面栏数
+    ("u_column_id", "float32"),         # Source column id
+    ("v_column_id", "float32"),         # Target column id
+    ("column_count", "float32"),        # Total column count
     ("text_line_count_ratio", "float32"), # v_lines / u_lines
 
-    # ===== PR4 新增特征（7个） =====
     ("vertical_gap_to_median_ratio", "float32"),  # (v.y1 - u.y2) / median_gap
     ("horizontal_gap_norm", "float32"),           # abs(v.cx - u.cx) / page_width
     ("column_distance", "float32"),               # abs(u.col - v.col)
     ("indent_diff_norm", "float32"),              # (v.x1 - u.x1) / page_width
     ("width_ratio", "float32"),                   # v.w / (u.w + 1)
-    ("u_is_cross_column", "float32"),             # u 是否跨栏（宽 > 0.7 * page_w）
-    ("header_footer_penalty", "float32"),         # 是否 header/footer
+    ("u_is_cross_column", "float32"),             # Source is cross-column (width > 0.7 * page_w)
+    ("header_footer_penalty", "float32"),         # Header/Footer penalty
+
+    ("relative_angle_sin", "float32"),            # sin(atan2(dy, dx))
+    ("relative_angle_cos", "float32"),            # cos(atan2(dy, dx))
+    ("bbox_iou", "float32"),                      # IoU between boxes
+    ("center_l1_norm", "float32"),                # Normalized L1 center distance
+    ("same_physical_column", "float32"),          # Robust physical same-column flag
+    ("reading_flow_score", "float32"),            # Reading-flow prior score
+    ("vertical_alignment_score", "float32"),      # Vertical alignment quality
+    ("reading_momentum", "float32"),              # Reading flow consistency
+    ("type_transition_prob", "float32"),          # Type transition likelihood
+    ("context_features", "float32"),              # Predecessor/successor context
 ]
 
-# 特征维度常量
-BLOCK_FEAT_DIM = len(BLOCK_SCHEMA)  # 29
-PAIR_FEAT_DIM = len(PAIR_SCHEMA)    # 41
+BLOCK_FEAT_DIM = len(BLOCK_SCHEMA)  # 33
+PAIR_FEAT_DIM = len(PAIR_SCHEMA)    # 51
 
 
-# =============================================================================
-# 数据统计容器
-# =============================================================================
 
 @dataclass
 class SkipStats:
@@ -224,19 +224,6 @@ class TrainingMetrics:
     metrics: Dict[str, float] = field(default_factory=dict)
     feature_importance: List[Tuple[int, float]] = field(default_factory=list)
 
-
-# =============================================================================
-# 辅助函数
-# =============================================================================
-
-def is_chinese(c: str) -> bool:
-    return '\u4e00' <= c <= '\u9fff'
-
-
-def re_split(t: str) -> List[str]:
-    return [x for x in re.split(r"\s+", t) if x]
-
-
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
     return a / b if b != 0 else default
 
@@ -271,7 +258,6 @@ def get_meta_field(block: Dict, field: str, default: float = 0.0) -> float:
     安全获取 block["meta"][field]，缺失返回 default
     支持从 block 直接获取（如 block["_column_id"]）
     """
-    # 先尝试从 meta 获取
     meta = block.get("meta")
     if meta is not None:
         val = meta.get(field)
@@ -281,7 +267,6 @@ def get_meta_field(block: Dict, field: str, default: float = 0.0) -> float:
             except (ValueError, TypeError):
                 pass
     
-    # 再尝试从 block 直接获取（带下划线前缀）
     direct_key = f"_{field}" if not field.startswith("_") else field
     val = block.get(direct_key)
     if val is not None:
@@ -290,7 +275,6 @@ def get_meta_field(block: Dict, field: str, default: float = 0.0) -> float:
         except (ValueError, TypeError):
             pass
     
-    # 最后尝试不带下划线
     val = block.get(field)
     if val is not None:
         try:
@@ -318,9 +302,6 @@ def save_schema(schema: List[Tuple[str, str]], path: str, version: str = SCHEMA_
         }, f, indent=2, ensure_ascii=False)
 
 
-# =============================================================================
-# 特征提取函数
-# =============================================================================
 
 def extract_block_feats(
     b: Dict[str, Any],
@@ -359,11 +340,9 @@ def extract_block_feats(
     page_w = max(1, page.get("width", 1))
     page_h = max(1, page.get("height", 1))
     
-    # 位置与尺寸特征
     area_ratio = (bw * bh) / (page_w * page_h)
     aspect = safe_div(bw, bh, default=0.0)
     
-    # 文本统计（与 eval.py _text_stats 对齐）
     txt = b.get("text", "") or ""
     n = len(txt)
     
@@ -380,13 +359,11 @@ def extract_block_feats(
     words = [w for w in txt.split() if w]
     mean_word_len = sum(len(w) for w in words) / len(words) if words else 0.0
     
-    # 来源
     src = (b.get("source") or "object").lower()
     src_object = 1.0 if src == "object" else 0.0
     src_ocr = 1.0 if "ocr" in src else 0.0
     src_heur = 1.0 if "heur" in src else 0.0
     
-    # 样式
     heading_level = 0.0
     style = b.get("style")
     if style and style.get("heading_level"):
@@ -395,25 +372,20 @@ def extract_block_feats(
         except (ValueError, TypeError):
             heading_level = 0.0
     
-    # 位置区域
     y_top_region = 1.0 if y1 < 0.1 * page_h else 0.0
     y_bottom_region = 1.0 if y2 > 0.9 * page_h else 0.0
     
-    # ===== 栏信息：优先使用参数，否则从 meta 读取 =====
     _column_id = column_id if column_id is not None else get_meta_field(b, "column_id", 0.0)
     _column_count = column_count if column_count is not None else get_meta_field(b, "column_count", 1.0)
     _is_first = is_first_in_column if is_first_in_column is not None else get_meta_field(b, "is_first_in_column", 0.0)
     _is_last = is_last_in_column if is_last_in_column is not None else get_meta_field(b, "is_last_in_column", 0.0)
     
-    # 文本行数：优先从 meta 读取，否则启发式估计
     text_line_count = get_meta_field(b, "text_line_count", -1.0)
     if text_line_count < 0:
         text_line_count = get_meta_field(b, "block_text_line_count", -1.0)
     if text_line_count < 0:
-        # 启发式：按换行符计数
         text_line_count = max(1.0, float(txt.count("\n") + 1)) if txt.strip() else 0.0
     
-    # 平均行高（归一化）
     avg_line_height_px = get_meta_field(b, "avg_line_height_px", -1.0)
     if avg_line_height_px < 0:
         avg_line_height_px = get_meta_field(b, "avg_line_height", -1.0)
@@ -421,15 +393,18 @@ def extract_block_feats(
     if avg_line_height_px > 0:
         avg_line_height_norm = avg_line_height_px / page_h
     else:
-        # 启发式：用 bbox 高度 / 行数
         if text_line_count > 0 and bh > 0:
             avg_line_height_norm = (bh / text_line_count) / page_h
         else:
             avg_line_height_norm = 0.0
     
-    # 构建特征向量（顺序必须与 BLOCK_SCHEMA 一致）
+    # New features for schema v2.3
+    rel_y_in_column = get_meta_field(b, "rel_y_in_column", y1 / page_h)
+    dist_to_left_margin = get_meta_field(b, "dist_to_left_margin", x1 / page_w)
+    dist_to_right_margin = get_meta_field(b, "dist_to_right_margin", (page_w - x2) / page_w)
+    vertical_density = get_meta_field(b, "vertical_density", 0.1)
+
     feats = [
-        # 位置与尺寸（8个）
         x1 / page_w,
         y1 / page_h,
         x2 / page_w,
@@ -438,8 +413,7 @@ def extract_block_feats(
         bh / page_h,
         area_ratio,
         aspect,
-        
-        # 文本统计（8个）
+
         float(n),
         digit_ratio,
         upper_ratio,
@@ -448,29 +422,28 @@ def extract_block_feats(
         mean_word_len,
         is_alnum,
         ch_ratio,
-        
-        # 样式（1个）
+
         heading_level,
-        
-        # 来源（3个）
+
         src_object,
         src_ocr,
         src_heur,
-        
-        # 位置区域（2个）
+
         y_top_region,
         y_bottom_region,
-        
-        # 高度百分位（1个）
+
         height_percentile,
-        
-        # 新增特征（6个）
+
         float(_column_id),
         float(_column_count),
         float(_is_first),
         float(_is_last),
         float(text_line_count),
         float(avg_line_height_norm),
+        float(rel_y_in_column),
+        float(dist_to_left_margin),
+        float(dist_to_right_margin),
+        float(vertical_density),
     ]
     
     assert len(feats) == BLOCK_FEAT_DIM, f"Block 特征维度错误: {len(feats)} != {BLOCK_FEAT_DIM}"
@@ -499,7 +472,6 @@ def extract_pair_feats(
     """
     import math
     
-    # 处理空输入
     if u is None or v is None:
         return [0.0] * PAIR_FEAT_DIM
     
@@ -511,14 +483,12 @@ def extract_pair_feats(
     ux1, uy1, ux2, uy2 = u_bbox[:4]
     vx1, vy1, vx2, vy2 = v_bbox[:4]
     
-    # 中心点
     uc_x, uc_y = (ux1 + ux2) / 2, (uy1 + uy2) / 2
     vc_x, vc_y = (vx1 + vx2) / 2, (vy1 + vy2) / 2
     
     page_w = max(1, page.get("width", 1))
     page_h = max(1, page.get("height", 1))
     
-    # 相对位置（与 eval.py 对齐）
     dx = vc_x - uc_x
     dy = vc_y - uc_y
     dist = math.hypot(dx, dy)
@@ -526,7 +496,6 @@ def extract_pair_feats(
     dy_norm = dy / page_h
     center_dist_norm = dist / math.hypot(page_w, page_h)
     
-    # 重叠
     uw, uh = max(1.0, ux2 - ux1), max(1.0, uy2 - uy1)
     vw, vh = max(1.0, vx2 - vx1), max(1.0, vy2 - vy1)
     ovx = overlap_1d(ux1, ux2, vx1, vx2)
@@ -534,11 +503,9 @@ def extract_pair_feats(
     x_overlap = ovx / min(uw, vw)
     y_overlap = ovy / min(uh, vh)
     
-    # 尺寸比例
     size_ratio_w = vw / uw
     size_ratio_h = vh / uh
     
-    # 布局关系（几何启发式）
     same_col = 1.0 if abs(ux1 - vx1) < 0.08 * page_w else 0.0
     is_above = 1.0 if uy2 <= vy1 else 0.0
     align_diff_left_norm = abs(ux1 - vx1) / page_w
@@ -546,11 +513,9 @@ def extract_pair_feats(
     same_row = 1.0 if abs(uc_y - vc_y) < 0.04 * page_h else 0.0
     left_to_right = 1.0 if (same_row > 0.5 and ux1 < vx1) else 0.0
     
-    # 间距
     gap_y = max(0.0, vy1 - uy2)
     gap_y_norm = gap_y / page_h
     
-    # 类型特征
     u_type = u.get("type", "unknown")
     v_type = v.get("type", "unknown")
     u_is_title = 1.0 if u_type == "title" else 0.0
@@ -570,11 +535,9 @@ def extract_pair_feats(
         except (ValueError, TypeError):
             v_hl = 0.0
     
-    # 类型 one-hot
     u_oh = coarse_type_onehot(u_type)
     v_oh = coarse_type_onehot(v_type)
     
-    # ===== 新增特征（与 eval.py 对齐）=====
     u_col_id = get_meta_field(u, "column_id", 0.0)
     v_col_id = get_meta_field(v, "column_id", 0.0)
     same_column_id = 1.0 if abs(u_col_id - v_col_id) < 0.5 else 0.0
@@ -582,7 +545,6 @@ def extract_pair_feats(
     
     _column_count = column_count if column_count is not None else get_meta_field(u, "column_count", 1.0)
     
-    # 文本行数（多种来源兼容）
     u_lines = get_meta_field(u, "text_line_count", -1.0)
     if u_lines < 0:
         u_lines = get_meta_field(u, "block_text_line_count", 1.0)
@@ -599,7 +561,6 @@ def extract_pair_feats(
     
     text_line_count_ratio = (v_lines + 1) / (u_lines + 1)
 
-    # ===== PR4 新增特征（7个）=====
     _median_gap = float(median_gap) if median_gap is not None else get_meta_field(u, "_median_gap", page_h * 0.01)
     _median_gap = max(1.0, _median_gap)
     vertical_gap_to_median_ratio = gap_y / _median_gap
@@ -618,22 +579,96 @@ def extract_pair_feats(
     v_hf = v_type in ("header", "footer")
     header_footer_penalty = 1.0 if (u_hf or v_hf) else 0.0
 
-    # 构建特征向量（顺序必须与 PAIR_SCHEMA 一致）
+    adv = compute_advanced_pair_features(u, v, page)
+    relative_angle_sin = float(adv.get("relative_angle_sin", 0.0))
+    relative_angle_cos = float(adv.get("relative_angle_cos", 0.0))
+    bbox_iou = float(adv.get("bbox_iou", 0.0))
+    center_l1_norm = float(adv.get("center_l1_norm", 0.0))
+    same_physical_column = float(adv.get("same_physical_column", 0.0))
+    reading_flow_score = float(adv.get("reading_flow_score", 0.0))
+
+    # --- Schema v2.3 features (bug-fixed & enhanced) ---
+
+    # vertical_alignment_score: use correct variable names (ux2/vx2/ux1/vx1/uw/vw)
+    va_overlap = max(0.0, min(ux2, vx2) - max(ux1, vx1))
+    vertical_alignment_score = va_overlap / min(uw, vw) if min(uw, vw) > 0 else 0.0
+
+    # reading_momentum: enhanced with backward penalty and lateral flow
+    if dy_norm > 0 and abs(dx_norm) < 0.05:
+        reading_momentum = 1.0     # strong downward flow
+    elif dy_norm > 0 and abs(dx_norm) < 0.15:
+        reading_momentum = 0.85    # slightly off-center downward
+    elif dy_norm > 0 and dx_norm > 0:
+        reading_momentum = 0.65    # down-right (column transition)
+    elif abs(dy_norm) < 0.03 and dx_norm > 0:
+        reading_momentum = 0.5     # horizontal left-to-right (same row)
+    elif dy_norm < -0.02:
+        reading_momentum = -0.3    # backward (wrong direction penalty)
+    else:
+        reading_momentum = 0.0
+
+    # type_transition_prob: comprehensive transition table
+    u_type = u.get("type", "unknown")
+    v_type = v.get("type", "unknown")
+    type_transitions = {
+        ("title", "paragraph"): 0.95,
+        ("title", "list_item"): 0.90,
+        ("title", "table"): 0.80,
+        ("title", "figure"): 0.75,
+        ("title", "formula"): 0.70,
+        ("title", "title"): 0.40,        # consecutive titles are rare
+        ("paragraph", "paragraph"): 0.85,
+        ("paragraph", "list_item"): 0.80,
+        ("paragraph", "title"): 0.45,     # new section
+        ("paragraph", "table"): 0.55,
+        ("paragraph", "figure"): 0.55,
+        ("paragraph", "formula"): 0.65,
+        ("list_item", "list_item"): 0.90,
+        ("list_item", "paragraph"): 0.70,
+        ("list_item", "title"): 0.40,
+        ("figure", "caption"): 0.92,
+        ("table", "caption"): 0.92,
+        ("chart", "caption"): 0.92,
+        ("caption", "paragraph"): 0.70,
+        ("caption", "title"): 0.50,
+        ("caption", "figure"): 0.35,      # caption before figure (unusual)
+        ("caption", "table"): 0.35,
+        ("formula", "paragraph"): 0.70,
+        ("formula", "formula"): 0.55,
+        ("header", "title"): 0.60,
+        ("header", "paragraph"): 0.55,
+        ("paragraph", "footer"): 0.30,
+        ("footer", "footer"): 0.20,
+    }
+    type_transition_prob = type_transitions.get((u_type, v_type), 0.40)
+
+    # context_features: compute actual contextual signal instead of constant 0.5
+    # Use text length ratio + spatial continuity as proxy for reading flow context
+    u_text_len = len((u.get("text") or "").strip())
+    v_text_len = len((v.get("text") or "").strip())
+    text_continuity = 0.0
+    if u_text_len > 0 and v_text_len > 0:
+        ratio = min(u_text_len, v_text_len) / max(u_text_len, v_text_len)
+        text_continuity = ratio * 0.6
+    # Bonus if same type and vertically aligned
+    if u_type == v_type and vertical_alignment_score > 0.5:
+        text_continuity += 0.3
+    # Penalty for large vertical gaps
+    if gap_y_norm > 0.15:
+        text_continuity *= 0.5
+    context_features = max(0.0, min(1.0, text_continuity))
+
     feats = [
-        # 相对位置（3个）
         dx_norm,
         dy_norm,
         center_dist_norm,
         
-        # 重叠（2个）
         x_overlap,
         y_overlap,
         
-        # 尺寸比例（2个）
         size_ratio_w,
         size_ratio_h,
         
-        # 布局关系（6个）
         same_col,
         is_above,
         align_diff_left_norm,
@@ -641,20 +676,16 @@ def extract_pair_feats(
         same_row,
         left_to_right,
         
-        # 间距（1个）
         gap_y_norm,
         
-        # 类型特征（4个）
         u_is_title,
         v_is_title,
         u_hl,
         v_hl,
         
-        # 类型 one-hot（10个）
         u_oh[0], u_oh[1], u_oh[2], u_oh[3], u_oh[4],
         v_oh[0], v_oh[1], v_oh[2], v_oh[3], v_oh[4],
         
-        # 新增特征（6个）
         same_column_id,
         column_diff,
         u_col_id,
@@ -662,7 +693,6 @@ def extract_pair_feats(
         float(_column_count),
         text_line_count_ratio,
 
-        # PR4 新增特征（7个）
         vertical_gap_to_median_ratio,
         horizontal_gap_norm,
         column_distance,
@@ -670,14 +700,22 @@ def extract_pair_feats(
         width_ratio,
         u_is_cross_column,
         header_footer_penalty,
+
+        relative_angle_sin,
+        relative_angle_cos,
+        bbox_iou,
+        center_l1_norm,
+        same_physical_column,
+        reading_flow_score,
+        vertical_alignment_score,
+        reading_momentum,
+        type_transition_prob,
+        context_features,
     ]
     
     assert len(feats) == PAIR_FEAT_DIM, f"Pair 特征维度错误: {len(feats)} != {PAIR_FEAT_DIM}"
     return feats
 
-# =============================================================================
-# 辅助数据结构
-# =============================================================================
 
 def build_id_map(blocks: List[Dict]) -> Dict[Any, Dict]:
     """构建 block id -> block 的映射"""
@@ -695,7 +733,6 @@ def rebuild_sequence_from_edges(order_edges: List[Dict]) -> List[Any]:
 
     heads = set(nxt.keys()) - set(nxt.values())
     if not heads:
-        # 可能有环，取任意起点
         heads = {list(nxt.keys())[0]}
 
     head = list(heads)[0]
@@ -706,7 +743,6 @@ def rebuild_sequence_from_edges(order_edges: List[Dict]) -> List[Any]:
         seen.add(cur)
         cur = nxt.get(cur)
 
-    # 添加最后一个节点
     if cur is not None and cur not in seen:
         seq.append(cur)
 
@@ -755,7 +791,6 @@ def detect_columns(blocks: List[Dict], page: Dict) -> Dict[Any, int]:
         column_map, _ = assign_block_columns(blocks, boundaries)
         return column_map
 
-    # 回退：简单间距分割
     centers = []
     for b in blocks:
         bbox = b.get("bbox")
@@ -802,20 +837,17 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
     column_count = len(set(column_map.values())) if column_map else 1
     page_h = max(1, page.get("height", 1))
 
-    # 计算页面中位数垂直间距（用于 PR4 新特征）
     if _HAS_READING_ORDER_UTILS:
         median_gap = compute_page_median_gap(blocks, page_h)
     else:
         median_gap = page_h * 0.01
 
-    # 按栏分组，并在栏内按 y 排序
     columns: Dict[int, List[Dict]] = defaultdict(list)
     for b in blocks:
         bid = b.get("id")
         col_id = column_map.get(bid, 0)
         columns[col_id].append(b)
 
-    # 每栏内按 y 排序，确定 first/last
     for col_id, col_blocks in columns.items():
         col_blocks.sort(key=lambda x: (x.get("bbox", [0, 0, 0, 0])[1], x.get("bbox", [0, 0, 0, 0])[0]))
 
@@ -829,7 +861,6 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
             b["meta"]["is_last_in_column"] = 1.0 if i == len(col_blocks) - 1 else 0.0
             b["meta"]["_median_gap"] = float(median_gap)
             
-            # 估计文本行数（如果尚未设置）
             if "text_line_count" not in b["meta"] and "block_text_line_count" not in b["meta"]:
                 txt = b.get("text", "") or ""
                 bbox = b.get("bbox", [0, 0, 0, 0])
@@ -842,14 +873,10 @@ def enrich_blocks_with_column_info(blocks: List[Dict], page: Dict) -> None:
                 
                 b["meta"]["text_line_count"] = float(line_count)
                 
-                # 估计平均行高
                 if line_count > 0 and bh > 0:
                     b["meta"]["avg_line_height_px"] = bh / line_count
 
 
-# =============================================================================
-# 负样本生成策略
-# =============================================================================
 
 @dataclass
 class NegativeSample:
@@ -880,7 +907,6 @@ def knn_negatives(
 
     max_negs = max_neg_ratio * max(len(positives), 1)
 
-    # 构建 KDTree
     centers = []
     ids = []
     for b in blocks:
@@ -913,13 +939,10 @@ def knn_negatives(
 
                 u_id, v_id = ids[idx], ids[j]
 
-                # 跳过正样本
                 if (u_id, v_id) in positives or (v_id, u_id) in positives:
                     continue
 
-                # 区分困难程度
                 if rank < k // 2:
-                    # 最近邻：困难负样本
                     negs.append(NegativeSample(u_id, v_id, 2.0, "hard_near"))
                 else:
                     negs.append(NegativeSample(u_id, v_id, 1.0, "random"))
@@ -927,7 +950,6 @@ def knn_negatives(
                 if len(negs) >= max_negs:
                     return negs
     else:
-        # 降级：暴力搜索
         for i, b1 in enumerate(blocks):
             for j, b2 in enumerate(blocks):
                 if i >= j:
@@ -959,17 +981,14 @@ def same_column_skip_negatives(
     """
     negs = []
 
-    # 按栏分组
     columns: Dict[int, List[Dict]] = defaultdict(list)
     for b in blocks:
         col_id = int(get_meta_field(b, "column_id", 0))
         columns[col_id].append(b)
 
     for col_id, col_blocks in columns.items():
-        # 按 y 排序
         col_blocks.sort(key=lambda x: x.get("bbox", [0, 0, 0, 0])[1])
 
-        # 生成跳跃负样本（隔 2-4 个块）
         for i in range(len(col_blocks)):
             for step in [2, 3, 4]:
                 j = i + step
@@ -982,11 +1001,9 @@ def same_column_skip_negatives(
                 if u_id is None or v_id is None:
                     continue
 
-                # 确保不是正样本
                 if (u_id, v_id) in positives:
                     continue
 
-                # 权重随跳跃步数递减
                 weight = 1.8 - 0.2 * step
                 negs.append(NegativeSample(u_id, v_id, weight, "same_column_skip"))
 
@@ -1012,7 +1029,6 @@ def cross_column_negatives(
     negs = []
     page_h = max(1, page.get("height", 1))
 
-    # 按栏分组
     columns: Dict[int, List[Dict]] = defaultdict(list)
     for b in blocks:
         col_id = int(get_meta_field(b, "column_id", 0))
@@ -1044,11 +1060,9 @@ def cross_column_negatives(
                     if (u_id, v_id) in positives:
                         continue
 
-                    # 逆向跨栏（右->左）：高权重负样本
                     if col_i > col_j:
                         negs.append(NegativeSample(u_id, v_id, 2.5, "cross_column"))
 
-                    # 正向跨栏但 y 位置不合理（不是"末尾->顶部"）
                     elif not (u_y_ratio > 0.7 and v_y_ratio < 0.3):
                         negs.append(NegativeSample(u_id, v_id, 1.5, "cross_column"))
 
@@ -1069,7 +1083,6 @@ def reverse_negatives(
     negs = []
 
     for (u_id, v_id) in positives:
-        # 确保反向边不是正样本
         if (v_id, u_id) not in positives:
             negs.append(NegativeSample(v_id, u_id, weight, "reverse"))
 
@@ -1089,10 +1102,8 @@ def weak_positive_samples(
     """
     weak_pos = []
 
-    # 只对正文类型生成弱正样本
     text_types = {"paragraph", "list_item"}
 
-    # 按栏分组
     columns: Dict[int, List[Dict]] = defaultdict(list)
     for b in blocks:
         if b.get("type") in text_types:
@@ -1100,7 +1111,6 @@ def weak_positive_samples(
             columns[col_id].append(b)
 
     for col_id, col_blocks in columns.items():
-        # 按 y 排序
         col_blocks.sort(key=lambda x: x.get("bbox", [0, 0, 0, 0])[1])
 
         for i in range(len(col_blocks) - 1):
@@ -1110,7 +1120,6 @@ def weak_positive_samples(
             if u_id is None or v_id is None:
                 continue
 
-            # 如果已经是正样本，跳过
             if (u_id, v_id) in positives:
                 continue
 
@@ -1119,9 +1128,6 @@ def weak_positive_samples(
     return weak_pos
 
 
-# =============================================================================
-# Caption 负样本
-# =============================================================================
 
 def caption_neg_cost(cap: Dict, tar: Dict, page: Dict) -> float:
     """计算 caption-target 的负样本代价（越小越困难）"""
@@ -1153,7 +1159,6 @@ def caption_negatives(
     negs = []
 
     for cap in caps:
-        # 按距离排序，取最近的 k 个
         cand = sorted(tars, key=lambda t: caption_neg_cost(cap, t, page))[:k]
 
         for tar in cand:
@@ -1171,9 +1176,6 @@ def caption_negatives(
     return negs
 
 
-# =============================================================================
-# 数据加载
-# =============================================================================
 
 def load_data(
     path: str,
@@ -1222,7 +1224,6 @@ def load_data(
             if not line:
                 continue
 
-            # 解析 JSON
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
@@ -1237,7 +1238,6 @@ def load_data(
                 page = ir.get("page", {})
                 rel = ir.get("relations", {})
 
-                # 数据验证
                 if not page or not isinstance(page, dict):
                     skip_stats.no_page += 1
                     continue
@@ -1254,15 +1254,12 @@ def load_data(
                     skip_stats.invalid_page_size += 1
                     continue
 
-                # 自动补充栏信息（如果缺失）
                 if enrich_column_info:
                     enrich_blocks_with_column_info(blocks, page)
 
                 id2b = build_id_map(blocks)
                 hp = compute_height_percentiles(blocks)
 
-                # ===== 提取 Block 特征 =====
-                # 预先计算栏信息（如果 enrich_column_info 已经做过，这里从 meta 读取）
                 column_info_map = {}
                 column_count = 1.0
                 for b in blocks:
@@ -1305,10 +1302,8 @@ def load_data(
                         skip_stats.block_feat_error += 1
                         continue
 
-                # ===== 提取 Order 关系特征 =====
                 pos_order: Set[Tuple] = set()
 
-                # 1. 直接相邻的正样本
                 for e in rel.get("order_edges", []):
                     u_obj = id2b.get(e.get("u"))
                     v_obj = id2b.get(e.get("v"))
@@ -1329,7 +1324,6 @@ def load_data(
                             skip_stats.pair_feat_error += 1
                             continue
 
-                # 2. 跳步正样本
                 seq = rebuild_sequence_from_edges(rel.get("order_edges", []))
                 if seq and len(seq) > 2:
                     for step in [2, 3]:
@@ -1355,7 +1349,6 @@ def load_data(
                                 except Exception:
                                     pass
 
-                # 3. 弱正样本（同栏相邻正文块）
                 weak_pos = weak_positive_samples(blocks, pos_order, id2b, weak_pos_weight)
                 for u_id, v_id, weight in weak_pos:
                     u_obj = id2b.get(u_id)
@@ -1371,7 +1364,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # 4. 负样本：KNN 困难负样本
                 knn_negs = knn_negatives(blocks, pos_order, k=6, max_neg_ratio=3)
                 for neg in knn_negs:
                     u_obj = id2b.get(neg.u_id)
@@ -1387,7 +1379,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # 5. 负样本：同栏跳跃负样本
                 skip_negs = same_column_skip_negatives(blocks, pos_order, id2b, max_samples=50)
                 for neg in skip_negs:
                     u_obj = id2b.get(neg.u_id)
@@ -1403,7 +1394,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # 6. 负样本：跨栏负样本
                 cross_negs = cross_column_negatives(blocks, pos_order, page, max_samples=30)
                 for neg in cross_negs:
                     u_obj = id2b.get(neg.u_id)
@@ -1419,7 +1409,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # 7. 负样本：反向负样本
                 rev_negs = reverse_negatives(pos_order, id2b, weight=rev_neg_weight)
                 for neg in rev_negs:
                     u_obj = id2b.get(neg.u_id)
@@ -1435,7 +1424,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # ===== 提取 Caption 关系特征 =====
                 pos_cap: Set[Tuple] = set()
 
                 for c in rel.get("caption_links", []):
@@ -1453,7 +1441,6 @@ def load_data(
                         except Exception:
                             pass
 
-                # Caption 负样本
                 caps = [b for b in blocks if b.get("type") == "caption"]
                 tars = [b for b in blocks if b.get("type") in ("figure", "table", "chart")]
 
@@ -1481,7 +1468,6 @@ def load_data(
                     print(f"⚠️ 跳过第 {line_num} 行: {err}")
                 continue
 
-    # 输出统计
     print(f"\n📊 数据加载完成:")
     print(f"   有效样本: {cnt}")
     print(f"   跳过样本: {skip_stats.total()}")
@@ -1503,9 +1489,6 @@ def load_data(
         skip_stats
     )
 
-# =============================================================================
-# 类别权重计算
-# =============================================================================
 
 def compute_class_weight(
     labels: List[int],
@@ -1537,7 +1520,6 @@ def compute_class_weight(
     if n_classes == 0:
         return {}
 
-    # 确保所有 LABEL_MAP 中的类都有权重
     for idx in range(len(LABEL_MAP)):
         if idx not in cnt:
             cnt[idx] = 0
@@ -1545,40 +1527,34 @@ def compute_class_weight(
     weights = {}
     for cls, count in cnt.items():
         if count == 0:
-            # 未出现的类给予最大权重
             weights[cls] = max_weight
             continue
             
-        # 基础权重：逆频率
         base_weight = total / (n_classes * max(count, 1))
 
-        # Focal 调制：罕见类获得更高权重
         freq = count / total
         focal_factor = (1 - freq) ** gamma
 
-        # 组合权重
         weight = base_weight * focal_factor
 
-        # 平滑处理
         weight = weight * (1 - smooth) + smooth
 
-        # 限制范围
         weight = max(min_weight, min(weight, max_weight))
 
         weights[cls] = weight
 
-    # 归一化，使平均权重约为 1
-    if weights:
-        avg_weight = sum(weights.values()) / len(weights)
+    # Normalize by observed classes only; unseen classes should not suppress
+    # effective weights of real training labels.
+    observed_weights = [weights[c] for c in cnt.keys() if cnt[c] > 0 and c in weights]
+    if observed_weights:
+        avg_weight = sum(observed_weights) / len(observed_weights)
         if avg_weight > 0:
-            weights = {cls: w / avg_weight for cls, w in weights.items()}
+            for cls in list(weights.keys()):
+                weights[cls] = weights[cls] / avg_weight
 
     return weights
 
 
-# =============================================================================
-# 指标计算
-# =============================================================================
 
 def compute_multiclass_metrics(
     y_true: np.ndarray,
@@ -1601,13 +1577,10 @@ def compute_multiclass_metrics(
     n_samples = len(y_true)
     n_classes = y_pred_proba.shape[1] if len(y_pred_proba.shape) > 1 else len(label_names)
 
-    # 预测类别
     y_pred = np.argmax(y_pred_proba, axis=1)
 
-    # Accuracy
     accuracy = np.mean(y_pred == y_true)
 
-    # Multi-class log loss
     eps = 1e-15
     y_pred_proba_clipped = np.clip(y_pred_proba, eps, 1 - eps)
     log_loss = 0.0
@@ -1615,14 +1588,12 @@ def compute_multiclass_metrics(
         log_loss -= np.log(y_pred_proba_clipped[i, y_true[i]])
     log_loss /= n_samples
 
-    # Per-class metrics
     per_class = {}
     f1_scores = []
 
     for cls_idx in range(min(n_classes, len(label_names))):
         cls_name = label_names[cls_idx]
 
-        # True positives, false positives, false negatives
         tp = np.sum((y_pred == cls_idx) & (y_true == cls_idx))
         fp = np.sum((y_pred == cls_idx) & (y_true != cls_idx))
         fn = np.sum((y_pred != cls_idx) & (y_true == cls_idx))
@@ -1672,40 +1643,32 @@ def compute_binary_metrics(
     """
     n_samples = len(y_true)
 
-    # 处理概率
     if len(y_pred_proba.shape) > 1:
         y_proba = y_pred_proba[:, 1] if y_pred_proba.shape[1] > 1 else y_pred_proba[:, 0]
     else:
         y_proba = y_pred_proba
 
-    # Binary log loss
     eps = 1e-15
     y_proba_clipped = np.clip(y_proba, eps, 1 - eps)
     log_loss = -np.mean(
         y_true * np.log(y_proba_clipped) + (1 - y_true) * np.log(1 - y_proba_clipped)
     )
 
-    # AUC (简化计算)
     try:
-        # 按预测概率排序
         sorted_indices = np.argsort(y_proba)[::-1]
         y_true_sorted = y_true[sorted_indices]
 
-        # 计算 AUC
         n_pos = np.sum(y_true == 1)
         n_neg = np.sum(y_true == 0)
 
         if n_pos > 0 and n_neg > 0:
-            # 累积正样本数
             cum_pos = np.cumsum(y_true_sorted)
-            # 每个负样本之前的正样本数之和
             auc = np.sum(cum_pos[y_true_sorted == 0]) / (n_pos * n_neg)
         else:
             auc = 0.5
     except Exception:
         auc = 0.5
 
-    # Precision, Recall, F1
     y_pred = (y_proba >= threshold).astype(int)
     tp = np.sum((y_pred == 1) & (y_true == 1))
     fp = np.sum((y_pred == 1) & (y_true == 0))
@@ -1725,9 +1688,6 @@ def compute_binary_metrics(
     }
 
 
-# =============================================================================
-# 训练函数
-# =============================================================================
 
 def train_lgb_classifier(
     X: np.ndarray,
@@ -1765,7 +1725,6 @@ def train_lgb_classifier(
         print(f"⚠️ 训练数据为空，跳过模型 {out_path}")
         return None
 
-    # 验证集为空时分割训练集
     if len(Xv) == 0 or len(yv) == 0:
         print(f"⚠️ 验证数据为空，使用训练数据的 10% 作为验证集")
         split_idx = int(len(X) * 0.9)
@@ -1779,7 +1738,6 @@ def train_lgb_classifier(
             sample_weight_val = sample_weight[val_idx]
             sample_weight = sample_weight[train_idx]
 
-    # 创建数据集
     ds = lgb.Dataset(
         X, label=y, weight=sample_weight,
         feature_name=feature_names if feature_names else 'auto'
@@ -1790,7 +1748,6 @@ def train_lgb_classifier(
         feature_name=feature_names if feature_names else 'auto'
     )
 
-    # 配置参数
     p = params.copy()
     n_estimators = p.pop("n_estimators", 500)
 
@@ -1802,7 +1759,6 @@ def train_lgb_classifier(
         p["objective"] = "binary"
         p["metric"] = ["binary_logloss", "auc"]
 
-    # 回调
     callbacks = [
         lgb.early_stopping(stopping_rounds=50, verbose=False),
         lgb.log_evaluation(period=100)
@@ -1820,11 +1776,9 @@ def train_lgb_classifier(
             callbacks=callbacks
         )
 
-        # 保存模型
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         model.save_model(out_path, num_iteration=model.best_iteration)
 
-        # 计算指标
         y_pred_proba = model.predict(Xv, num_iteration=model.best_iteration)
 
         if num_class and num_class > 2:
@@ -1832,11 +1786,9 @@ def train_lgb_classifier(
         else:
             metrics = compute_binary_metrics(yv, y_pred_proba)
 
-        # 特征重要性
         importance = model.feature_importance(importance_type='gain')
         top_features = sorted(enumerate(importance), key=lambda x: -x[1])[:10]
 
-        # 输出结果
         print(f"✅ 模型已保存: {out_path}")
         print(f"   Best iteration: {model.best_iteration}")
         print(f"   验证指标: {json.dumps(metrics, ensure_ascii=False)}")
@@ -1865,9 +1817,6 @@ def train_lgb_classifier(
         return None
 
 
-# =============================================================================
-# 缓存管理
-# =============================================================================
 
 def cache_path(cache_dir: str, split_name: str) -> str:
     """生成缓存文件路径"""
@@ -1925,9 +1874,6 @@ def load_or_extract(
     return Xb, yb, Xo, yo, wo, Xc, yc, wc, skip_stats
 
 
-# =============================================================================
-# 训练摘要
-# =============================================================================
 
 def save_training_summary(
     out_dir: str,
@@ -1965,7 +1911,6 @@ def save_training_summary(
         "models": {}
     }
 
-    # Block 分类器指标
     if block_metrics:
         summary["models"]["block_classifier"] = {
             "best_iteration": block_metrics.best_iteration,
@@ -1978,7 +1923,6 @@ def save_training_summary(
             ]
         }
 
-    # Order 模型指标
     if order_metrics:
         summary["models"]["relation_scorer_order"] = {
             "best_iteration": order_metrics.best_iteration,
@@ -1991,7 +1935,6 @@ def save_training_summary(
             ]
         }
 
-    # Caption 模型指标
     if caption_metrics:
         summary["models"]["relation_scorer_caption"] = {
             "best_iteration": caption_metrics.best_iteration,
@@ -2004,13 +1947,11 @@ def save_training_summary(
             ]
         }
 
-    # 数据统计
     summary["data_stats"] = {
         "train_skip": train_skip_stats.summary() if train_skip_stats else None,
         "val_skip": val_skip_stats.summary() if val_skip_stats else None
     }
 
-    # 保存
     summary_path = os.path.join(out_dir, "training_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -2037,7 +1978,6 @@ def print_final_summary(
         print(f"   Accuracy: {m.get('accuracy', 'N/A')}")
         print(f"   Macro-F1: {m.get('macro_f1', 'N/A')}")
 
-        # 打印重要类别的 F1
         per_class = m.get("per_class", {})
         important_classes = ["title", "paragraph", "table", "figure", "caption"]
         for cls in important_classes:
@@ -2065,9 +2005,6 @@ def print_final_summary(
     print("\n" + "=" * 60)
 
 
-# =============================================================================
-# 主函数
-# =============================================================================
 
 def main():
     ap = argparse.ArgumentParser(
@@ -2075,53 +2012,45 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # 数据路径
     ap.add_argument("--train", required=True, help="训练数据 JSONL 路径")
     ap.add_argument("--val", required=True, help="验证数据 JSONL 路径")
     ap.add_argument("--out-dir", default="artifacts", help="输出目录")
     ap.add_argument("--cache-dir", default=None, help="特征缓存目录")
     ap.add_argument("--force-rebuild", action="store_true", help="强制重新提取特征")
 
-    # 随机种子
     ap.add_argument("--seed", type=int, default=42, help="随机种子")
 
-    # 数据采样
     ap.add_argument("--max-samples", type=int, default=None, help="最大样本数")
 
-    # LightGBM 参数
     ap.add_argument("--n-jobs", type=int, default=8, help="并行线程数")
-    ap.add_argument("--num-leaves", type=int, default=96, help="叶子节点数")
+    ap.add_argument("--num-leaves", type=int, default=127, help="叶子节点数")
     ap.add_argument("--max-depth", type=int, default=-1, help="最大深度")
     ap.add_argument("--learning-rate", type=float, default=0.05, help="学习率")
-    ap.add_argument("--n-estimators", type=int, default=500, help="迭代次数")
-    ap.add_argument("--feature-fraction", type=float, default=0.9, help="特征采样比例")
-    ap.add_argument("--bagging-fraction", type=float, default=0.8, help="样本采样比例")
+    ap.add_argument("--n-estimators", type=int, default=1200, help="迭代次数")
+    ap.add_argument("--min-child-weight", type=float, default=5.0, help="最小子节点权重")
+    ap.add_argument("--feature-fraction", type=float, default=0.85, help="特征采样比例")
+    ap.add_argument("--bagging-fraction", type=float, default=0.85, help="样本采样比例")
     ap.add_argument("--bagging-freq", type=int, default=1, help="采样频率")
     ap.add_argument("--lambda-l1", type=float, default=0.0, help="L1 正则")
     ap.add_argument("--lambda-l2", type=float, default=1.0, help="L2 正则")
     ap.add_argument("--min-data-in-leaf", type=int, default=20, help="叶子最小样本数")
     ap.add_argument("--max-bin", type=int, default=255, help="最大分箱数")
 
-    # 样本权重参数
     ap.add_argument("--jump-weight", type=float, default=0.3, help="跳步正样本权重")
     ap.add_argument("--rev-neg-weight", type=float, default=2.0, help="反向负样本权重")
     ap.add_argument("--weak-pos-weight", type=float, default=0.5, help="弱正样本权重")
     ap.add_argument("--cross-col-neg-weight", type=float, default=1.5, help="跨栏负样本权重系数")
 
-    # 类别权重参数
     ap.add_argument("--class-weight-gamma", type=float, default=1.5, help="类别权重 Focal gamma")
     ap.add_argument("--class-weight-smooth", type=float, default=0.1, help="类别权重平滑系数")
 
     args = ap.parse_args()
 
-    # 设置随机种子
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    # 创建输出目录
     Path(os.path.join(args.out_dir, "models")).mkdir(parents=True, exist_ok=True)
 
-    # 打印配置
     print("=" * 60)
     print("Document Layout Analysis - Training")
     print("=" * 60)
@@ -2132,7 +2061,6 @@ def main():
     print(f"输出目录: {args.out_dir}")
     print("=" * 60)
 
-    # 加载数据
     print("\n" + "-" * 40)
     print("加载训练数据...")
     print("-" * 40)
@@ -2145,7 +2073,6 @@ def main():
     (Xb_va, yb_va, Xo_va, yo_va, wo_va,
      Xc_va, yc_va, wc_va, val_skip_stats) = load_or_extract(args.val, "val", args)
 
-    # 验证特征维度
     if len(Xb_tr) > 0 and Xb_tr.shape[1] != BLOCK_FEAT_DIM:
         print(f"❌ Block 特征维度不匹配: {Xb_tr.shape[1]} != {BLOCK_FEAT_DIM}")
         print("   可能是缓存版本不匹配，请使用 --force-rebuild 重新提取特征")
@@ -2156,12 +2083,12 @@ def main():
         print("   可能是缓存版本不匹配，请使用 --force-rebuild 重新提取特征")
         sys.exit(1)
 
-    # LightGBM 基础参数
     base_params = {
         "num_leaves": args.num_leaves,
         "max_depth": args.max_depth,
         "learning_rate": args.learning_rate,
         "n_estimators": args.n_estimators,
+        "min_child_weight": args.min_child_weight,
         "n_jobs": args.n_jobs,
         "verbose": -1,
         "feature_fraction": args.feature_fraction,
@@ -2174,16 +2101,13 @@ def main():
         "seed": args.seed
     }
 
-    # 获取特征名称
     block_feature_names = [name for name, _ in BLOCK_SCHEMA]
     pair_feature_names = [name for name, _ in PAIR_SCHEMA]
 
-    # ===== 训练 Block 分类器 =====
     print("\n" + "=" * 60)
     print("训练 Block 分类器")
     print("=" * 60)
 
-    # 计算类别权重
     cw = compute_class_weight(
         yb_tr.tolist(),
         gamma=args.class_weight_gamma,
@@ -2207,7 +2131,6 @@ def main():
         feature_names=block_feature_names
     )
 
-    # ===== 训练 Order 关系模型 =====
     print("\n" + "=" * 60)
     print("训练 Order 关系模型")
     print("=" * 60)
@@ -2221,7 +2144,6 @@ def main():
         feature_names=pair_feature_names
     )
 
-    # ===== 训练 Caption 匹配模型 =====
     print("\n" + "=" * 60)
     print("训练 Caption 匹配模型")
     print("=" * 60)
@@ -2239,7 +2161,6 @@ def main():
     else:
         print("⚠️ 数据集中没有 Caption 样本，跳过 relation_scorer_caption 训练")
 
-    # ===== 保存 Schema 和 Label Map =====
     print("\n" + "-" * 40)
     print("保存 Schema 和 Label Map...")
     print("-" * 40)
@@ -2257,14 +2178,12 @@ def main():
     save_schema(PAIR_SCHEMA, pair_schema_path, version=SCHEMA_VERSION)
     print(f"✅ 保存: {pair_schema_path}")
 
-    # ===== 保存训练摘要 =====
     save_training_summary(
         args.out_dir, args,
         block_metrics, order_metrics, caption_metrics,
         train_skip_stats, val_skip_stats
     )
 
-    # ===== 打印最终摘要 =====
     print_final_summary(block_metrics, order_metrics, caption_metrics)
 
     print("\n🎉 训练完成!")

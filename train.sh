@@ -1,62 +1,100 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# train.sh
+trap 'echo "[ERROR] train.sh failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-# Overridable variables
-RAW_ANNOTATION="${RAW_ANNOTATION:-./datasets/label/train.jsonl}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+DATA_DIR="${DATA_DIR:-}"
+TRAIN_LABEL="${TRAIN_LABEL:-./datasets/label/train.jsonl}"
 IMAGE_ROOT="${IMAGE_ROOT:-./datasets/image/train}"
 WORK_DIR="${WORK_DIR:-./output/train_workdir}"
-DEPLOY_DIR="${DEPLOY_DIR:-./artifacts_v2}"
-CONFIG_FILE="${CONFIG_FILE:-./trainer/config/config.yaml}"
+OUTPUT_PATH="${OUTPUT_PATH:-./artifacts_v2}"
+CONFIG_FILE="${CONFIG_FILE:-./trainer/config/config_optimized.yaml}"
 TRAIN_RATIO="${TRAIN_RATIO:-0.9}"
 SEED="${SEED:-42}"
 PROFILE="${PROFILE:-accurate}"
-DRY_RUN="${DRY_RUN:-0}"
+LOG_DIR="${LOG_DIR:-./logs}"
 
-# Environment activation (prefer local .venv, then conda, then system Python)
-if [ -f "./.venv/bin/activate" ]; then
-    # shellcheck disable=SC1091
-    source "./.venv/bin/activate"
-elif command -v conda >/dev/null 2>&1; then
-    CONDA_PATH=$(conda info --base)
-    # shellcheck disable=SC1091
-    source "$CONDA_PATH/etc/profile.d/conda.sh"
-    conda activate docparse || echo "⚠️ conda env 'docparse' not found, falling back to system Python"
-else
-    echo "⚠️ No .venv or conda detected, using system Python."
+usage() {
+  cat <<'USAGE'
+Usage:
+  bash train.sh [options]
+
+Options:
+  --data_dir DIR           Shortcut: DIR/train.jsonl and DIR/images
+  --train-label FILE       Training label JSONL
+  --image-root DIR         Training image root
+  --work-dir DIR           Intermediate output dir
+  --output-path DIR        Final artifact export dir
+  --config FILE            Config path
+  --train-ratio FLOAT      Train split ratio
+  --seed INT               Random seed
+  --profile NAME           preprocess profile
+  --log-dir DIR            log directory
+  --help                   show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --data_dir) DATA_DIR="$2"; shift 2 ;;
+    --train-label) TRAIN_LABEL="$2"; shift 2 ;;
+    --image-root) IMAGE_ROOT="$2"; shift 2 ;;
+    --work-dir) WORK_DIR="$2"; shift 2 ;;
+    --output-path) OUTPUT_PATH="$2"; shift 2 ;;
+    --config) CONFIG_FILE="$2"; shift 2 ;;
+    --train-ratio) TRAIN_RATIO="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --log-dir) LOG_DIR="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [[ -n "$DATA_DIR" ]]; then
+  if [[ "$TRAIN_LABEL" == "./datasets/label/train.jsonl" ]]; then
+    TRAIN_LABEL="${DATA_DIR}/train.jsonl"
+  fi
+  if [[ "$IMAGE_ROOT" == "./datasets/image/train" ]]; then
+    IMAGE_ROOT="${DATA_DIR}/images"
+  fi
 fi
 
-PYTHON_BIN="$(command -v python || command -v python3)"
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-mkdir -p "$WORK_DIR/models"
-mkdir -p "$DEPLOY_DIR"
-
-if [ ! -f "$RAW_ANNOTATION" ]; then
-    echo "❌ Missing training annotation file: $RAW_ANNOTATION"
-    exit 1
+if [[ -f "./.venv/bin/activate" ]]; then
+  # shellcheck disable=SC1091
+  source "./.venv/bin/activate"
 fi
-if [ ! -d "$IMAGE_ROOT" ]; then
-    echo "❌ Missing training image root: $IMAGE_ROOT"
-    exit 1
-fi
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ Missing config file: $CONFIG_FILE"
-    exit 1
+PYTHON_BIN="$(command -v python3 || command -v python)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "[ERROR] python not found" >&2
+  exit 1
 fi
 
-if [ "$DRY_RUN" = "1" ]; then
-    echo "[DRY_RUN] $PYTHON_BIN ./trainer/dataset/preprocess.py --input $RAW_ANNOTATION --output-train $WORK_DIR/train.jsonl --output-val $WORK_DIR/val.jsonl --image-root $IMAGE_ROOT --train-ratio $TRAIN_RATIO --seed $SEED --enable-ocr --ocr-use-gpu --profile $PROFILE"
-    echo "[DRY_RUN] $PYTHON_BIN train.py --train $WORK_DIR/train.jsonl --val $WORK_DIR/val.jsonl --out-dir $WORK_DIR --seed $SEED"
-    echo "[DRY_RUN] $PYTHON_BIN merge_lora.py export --config $CONFIG_FILE --output $DEPLOY_DIR --models-dir $WORK_DIR/models --schema-dir $WORK_DIR"
-    exit 0
-fi
+[[ -f "$TRAIN_LABEL" ]] || { echo "[ERROR] train jsonl missing: $TRAIN_LABEL" >&2; exit 1; }
+[[ -d "$IMAGE_ROOT" ]] || { echo "[ERROR] image root missing: $IMAGE_ROOT" >&2; exit 1; }
+[[ -f "$CONFIG_FILE" ]] || { echo "[ERROR] config missing: $CONFIG_FILE" >&2; exit 1; }
 
-echo "==== [Step 1/3] Preprocess and feature extraction ===="
-"$PYTHON_BIN" ./trainer/dataset/preprocess.py \
-    --input "$RAW_ANNOTATION" \
-    --output-train "$WORK_DIR/train.jsonl" \
-    --output-val "$WORK_DIR/val.jsonl" \
+mkdir -p "$WORK_DIR/models" "$OUTPUT_PATH" "$LOG_DIR"
+
+TRAIN_JSONL="${WORK_DIR}/train.jsonl"
+VAL_JSONL="${WORK_DIR}/val.jsonl"
+TS="$(date +%Y%m%d_%H%M%S)"
+RUN_LOG="${LOG_DIR}/train_${TS}.log"
+
+{
+  echo "[INFO] Step 0.5 clean dataset"
+  "$PYTHON_BIN" ./trainer/dataset/clean_dataset.py \
+    --input "$TRAIN_LABEL" \
+    --output "${WORK_DIR}/train_cleaned.jsonl"
+
+  echo "[INFO] Step1 preprocess"
+  "$PYTHON_BIN" ./trainer/dataset/preprocess.py \
+    --input "${WORK_DIR}/train_cleaned.jsonl" \
+    --output-train "$TRAIN_JSONL" \
+    --output-val "$VAL_JSONL" \
     --image-root "$IMAGE_ROOT" \
     --train-ratio "$TRAIN_RATIO" \
     --seed "$SEED" \
@@ -64,19 +102,20 @@ echo "==== [Step 1/3] Preprocess and feature extraction ===="
     --ocr-use-gpu \
     --profile "$PROFILE"
 
-echo "==== [Step 2/3] Train LightGBM models ===="
-"$PYTHON_BIN" train.py \
-    --train "$WORK_DIR/train.jsonl" \
-    --val "$WORK_DIR/val.jsonl" \
+  echo "[INFO] Step2 train models"
+  "$PYTHON_BIN" train.py \
+    --train "$TRAIN_JSONL" \
+    --val "$VAL_JSONL" \
     --out-dir "$WORK_DIR" \
     --seed "$SEED"
 
-echo "==== [Step 3/3] Export deployment artifacts ===="
-"$PYTHON_BIN" merge_lora.py export \
+  echo "[INFO] Step3 export artifacts"
+  "$PYTHON_BIN" ./trainer/merge/merge_lora.py export \
     --config "$CONFIG_FILE" \
-    --output "$DEPLOY_DIR" \
+    --output "$OUTPUT_PATH" \
     --models-dir "$WORK_DIR/models" \
     --schema-dir "$WORK_DIR"
 
-echo "==== Training finished ===="
-echo "Artifacts directory: $DEPLOY_DIR"
+  echo "[INFO] training pipeline done"
+  echo "[INFO] artifacts=${OUTPUT_PATH}"
+} 2>&1 | tee "$RUN_LOG"

@@ -1,0 +1,149 @@
+# ============================================================================
+# Optimized config for multimodal document parsing competition
+# Target: SOTA performance on mAP, F1, BLEU, TEDS, KTDS metrics
+# ============================================================================
+
+profile: "competition"
+
+io:
+  image_root: "./data/images"
+  output_dir: "./artifacts_v23"
+  cache_dir: "./cache"
+  enable_cache: true
+  log_level: "INFO"
+
+runtime:
+  device: "auto"
+  num_workers: 4
+  use_fp16: true
+  lazy_load_fallback: true
+
+pipeline:
+  enable_ocr: false
+  parallel_workers: 0
+
+models:
+  logic_models:
+    block_classifier: "block_classifier.json"
+    relation_scorer: "relation_scorer_order.json"
+    relation_scorer_caption: "relation_scorer_caption.json"
+
+  feature_schemas:
+    block: "feature_schema_block.json"
+    pair: "feature_schema_pair.json"
+    label_map: "label_map.json"
+
+  fallback_models:
+    layout_detector:
+      enabled: true
+      type: "yolo"
+      version: "yolov8n"
+      score_threshold: 0.18              # Lower for better recall on small elements
+      postprocess:
+        nested_suppression: true
+        nested_iou_threshold: 0.88       # Less aggressive suppression
+        nested_containment_threshold: 0.90
+        title_paragraph_refine: true
+        title_boost_ratio: 1.35
+        paragraph_boost_ratio: 1.05
+      input_size: 1280                   # Higher resolution
+      nms_class_aware: true
+      hf_correction: true
+      second_pass: true
+      second_pass_min_dets: 5            # Trigger on sparse pages
+      second_pass_min_nontext: 0
+      second_pass_min_avg_score: 0.25
+      second_pass_input_size: 1536
+      second_pass_score_threshold: 0.12
+
+    ocr:
+      enabled: true
+      version: "PP-OCRv4"
+      lang: "ch"
+      text_det_limit_side_len: 1536
+      text_rec_score_thresh: 0.30        # Lower threshold for better recall
+      line_score_threshold: 0.30
+      line_min_text_len: 1               # Capture single characters
+      full_image_max_side: 1920          # Preserve detail
+      reuse_full_image_for_layout: true
+      reuse_min_blocks: 1
+      roi_types: ["paragraph", "title", "list_item", "caption"]
+      text_correction:
+        enabled: true
+        use_phrase_rules: true
+        use_domain_terms: true
+        use_char_lm: true
+        normalize_punctuation: false
+
+    table_refiner:
+      enabled: true
+      min_area_ratio: 0.003              # Detect smaller tables
+      max_side: 1600
+      transformer:
+        enabled: true                    # Enable by default for better TEDS
+        backend: "hf_vision2seq"
+        model_name_or_path: "microsoft/table-transformer-structure-recognition"
+        max_new_tokens: 512
+        prompt: "Output HTML table with rowspan/colspan only."
+
+    formula_ocr:
+      transformer:
+        enabled: false                   # Disable Nougat for speed and rely on OCR heuristics
+        backend: "hf_vision2seq"
+        model_name_or_path: "facebook/nougat-small"
+        max_new_tokens: 256
+        prompt: "Read this formula and output pure LaTeX."
+
+decode:
+  k_order: 16                            # More candidates for complex layouts
+  k_caption: 6
+  use_beam_search: true
+  beam_width: 6
+  order_score_threshold: 0.18
+  caption_score_threshold: 0.30
+
+  reading_order_hybrid:
+    enabled: true
+    projection_bins: 96                  # Smoother column detection
+    min_gap_ratio: 0.040
+    low_occupancy_ratio: 0.05
+    max_cuts_per_level: 3
+    max_depth: 10
+    vertical_bias: 1.20
+    cross_span_ratio: 0.75
+    row_tol_ratio: 0.40
+    row_tol_px: 8
+    edge_min_score: 0.45                 # Accept more connections
+    overlap_iou_threshold: 0.30
+    overlap_failure_ratio: 0.25
+    default_edge_score: 0.95
+
+  fallback_trigger:
+    enabled: true
+    min_blocks: 2
+    max_empty_text_block_ratio: 0.0
+    trigger_detector: true
+    trigger_ocr: true
+
+# Competition profile - optimized for all metrics
+profiles:
+  competition:
+    fallback_models:
+      layout_detector:
+        input_size: 1280
+        score_threshold: 0.18
+        nms_class_aware: true
+        hf_correction: true
+        second_pass: true
+      ocr:
+        text_det_limit_side_len: 1536
+        text_rec_score_thresh: 0.30
+        line_score_threshold: 0.30
+        line_min_text_len: 1
+        full_image_max_side: 1920
+      table_refiner:
+        enabled: true
+        min_area_ratio: 0.003
+        max_side: 1600
+        transformer:
+          enabled: true
