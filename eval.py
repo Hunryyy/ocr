@@ -62,13 +62,13 @@ except ImportError:  # pragma: no cover
     Image = None
 
 try:
-    from order_features import compute_advanced_pair_features
+    from src.order_features import compute_advanced_pair_features
 except Exception:  # pragma: no cover
     def compute_advanced_pair_features(u: Dict[str, Any], v: Dict[str, Any], page: Dict[str, Any]) -> Dict[str, float]:  # type: ignore
         return {}
 
 try:
-    from layout_postprocess import suppress_nested_detections, refine_title_paragraph_blocks
+    from src.layout_postprocess import suppress_nested_detections, refine_title_paragraph_blocks
 except Exception:  # pragma: no cover
     def suppress_nested_detections(detections: List[Dict[str, Any]], iou_threshold: float = 0.92, containment_threshold: float = 0.94):  # type: ignore
         return detections, {"suppressed_nested": 0}
@@ -118,7 +118,7 @@ except Exception:  # pragma: no cover
             return (x or "").strip()
 
 try:
-    from reading_order import (
+    from src.reading_order_utils import (
         detect_columns_by_projection as _detect_cols_proj,
         assign_block_columns as _assign_block_cols,
         compute_page_median_gap as _compute_median_gap,
@@ -139,7 +139,7 @@ except Exception:  # pragma: no cover
         _compute_median_gap = None  # type: ignore
 
 try:
-    from modules.reading_order import (
+    from src.reading_order_pipeline import (
         xycut_graph_sort as _xycut_graph_sort,
         build_chain_order_edges as _build_chain_order_edges,
     )
