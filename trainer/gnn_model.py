@@ -13,7 +13,7 @@ except ImportError:
     class Batch: pass
 
 class DocumentGNN(nn.Module):
-    def __init__(self, node_in_dim=29, edge_in_dim=47, hidden_dim=128, num_classes=11, heads=4):
+    def __init__(self, node_in_dim=33, edge_in_dim=51, hidden_dim=128, num_classes=11, heads=4):
         """
         GNN model for Document Parsing.
         Predicts node classes (for F1 element classification) 

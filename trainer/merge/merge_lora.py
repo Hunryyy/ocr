@@ -65,10 +65,10 @@ except ImportError:
 
 
 
-DEFAULT_FEATURE_SCHEMA_VERSION = "2.2"
+DEFAULT_FEATURE_SCHEMA_VERSION = "2.3"
 
-EXPECTED_BLOCK_FEAT_DIM = 29  # Block feature dimension
-EXPECTED_PAIR_FEAT_DIM = 47   # Pair feature dimension
+EXPECTED_BLOCK_FEAT_DIM = 33  # Block feature dimension (aligned with train.py v2.3)
+EXPECTED_PAIR_FEAT_DIM = 51   # Pair feature dimension (aligned with train.py v2.3)
 
 IR_SCHEMA_VERSION = "v1"
 
